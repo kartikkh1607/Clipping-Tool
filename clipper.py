@@ -26,6 +26,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import wave
 from pathlib import Path
@@ -55,8 +56,8 @@ DEFAULTS = {
     "hindi_caption_font": "Nirmala UI",  # supports Devanagari
     "hinglish_roman_captions": True,     # hi: transliterate captions to Roman Hinglish via Gemini
     "gemini_api_key": "",                # free key: https://aistudio.google.com/apikey
-    "gemini_model": "gemini-3.8-flash",
-    "gemini_fallback_models": ["gemini-3.7-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite"],
+    "gemini_model": "gemini-3.5-flash-lite",                           # free tier: 500/day, 15/min
+    "gemini_fallback_models": ["gemini-3.6-flash", "gemini-3.8-flash"],  # free tier: 20/day, 5/min each
     "max_download_height": 1080,
     "cookies_from_browser": "",          # e.g. "chrome" for age-restricted videos (not used with pot_provider)
     "pot_provider": True,                # start/check the bgutil PO Token server before YouTube downloads
@@ -648,24 +649,41 @@ def pick_non_overlapping(cands: list[dict], k: int, gap: float = 5.0) -> list[di
     return chosen
 
 
+_GEMINI_LOCK = threading.Lock()
+_GEMINI_LAST = [0.0]
+GEMINI_MIN_INTERVAL = 60 / 14   # free tier allows 15 requests/min: stay just under, even from parallel threads
+GEMINI_USED: set[str] = set()   # models that answered during this run
+
+
 def gemini_json(client, cfg: dict, prompt: str, temperature: float):
-    """generate_content with JSON output; retries busy models and falls back to other models."""
+    """generate_content with JSON output. 429 (quota) -> next model at once; 503/timeout -> wait and retry."""
     from google.genai import types
 
     models = [cfg["gemini_model"]] + [m for m in cfg.get("gemini_fallback_models", []) if m != cfg["gemini_model"]]
     err = None
     for model in models:
         for attempt in range(3):
+            with _GEMINI_LOCK:  # one call at a time, spaced out: calls are queued, never burst
+                wait = _GEMINI_LAST[0] + GEMINI_MIN_INTERVAL - time.time()
+                if wait > 0:
+                    time.sleep(wait)
+                _GEMINI_LAST[0] = time.time()
             try:
                 resp = client.models.generate_content(
                     model=model, contents=prompt,
                     config=types.GenerateContentConfig(response_mime_type="application/json", temperature=temperature),
                 )
-                return json.loads(resp.text)
+                data = json.loads(resp.text)
+                GEMINI_USED.add(model)
+                log(f"  Gemini answered with {model}")
+                return data
             except Exception as e:
                 err = e
-                busy = any(c in str(e) for c in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "timed out", "Timeout"))
-                log(f"  Gemini {model} attempt {attempt + 1}: {str(e)[:70]}")
+                msg = str(e)
+                log(f"  Gemini {model} attempt {attempt + 1}: {msg[:70]}")
+                if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+                    break  # quota used up for this model: retrying won't help, try the next one
+                busy = any(c in msg for c in ("503", "UNAVAILABLE", "timed out", "Timeout"))
                 if busy and attempt < 2:
                     time.sleep(5 if attempt == 0 else 20)
                     continue
@@ -744,6 +762,8 @@ Candidates:
         client = genai.Client(api_key=key, http_options={"timeout": 90_000})  # ms; never hang forever
         data = gemini_json(client, cfg, prompt, 0.4)
         clips = data["clips"] if isinstance(data, dict) else data
+        log(f"  Gemini returned {len(clips)} picks: " + ", ".join(
+            f"id {c.get('id')} {float(c.get('start', 0)):.0f}-{float(c.get('end', 0)):.0f}s" for c in clips))
     except Exception as e:
         log(f"Gemini step failed ({str(e)[:200]}) - using automatic picks")
         return None
@@ -756,11 +776,14 @@ Candidates:
             s = max(0.0, min(float(c.get("start", base["start"])), dur - lo))
             e = float(c.get("end", base["end"]))
             if abs(s - base["start"]) > 12:  # model drifted off its candidate - don't trust it
+                log(f"  Gemini pick id {c['id']} dropped: start {s:.0f}s is {abs(s - base['start']):.0f}s from its candidate")
                 continue
             e = min(max(e, s + lo), s + hi, dur)
             if e - s < min(lo, dur) - 0.5:
+                log(f"  Gemini pick id {c['id']} dropped: too short ({e - s:.0f}s)")
                 continue
             if any(not (e + 1 <= x["start"] or s >= x["end"] + 1) for x in out):
+                log(f"  Gemini pick id {c['id']} dropped: overlaps an earlier pick ({s:.0f}-{e:.0f}s)")
                 continue
             out.append({**base, "start": round(s, 2), "end": round(e, 2),
                         "title": str(c.get("title", ""))[:100], "banner": str(c.get("banner", ""))[:60],
@@ -770,7 +793,8 @@ Candidates:
                         "format": str(c.get("format", "")), "game": str(c.get("game", ""))})
             if cfg.get("campaign"):  # hard cap: banners are hooks, not sentences
                 out[-1]["banner"] = " ".join(out[-1]["banner"].split()[:6])
-        except Exception:
+        except Exception as ex:
+            log(f"  Gemini pick dropped: unreadable ({str(ex)[:60]})")
             continue
         if len(out) >= k:
             break
@@ -1123,6 +1147,7 @@ def make_video_folder(cfg: dict, meta: dict) -> Path:
 
 def process(source: str, cfg: dict, local: bool, credit: str = "", local_title: str = "") -> Path:
     t0 = time.time()
+    GEMINI_USED.clear()
     tmp_root = Path(cfg["output_root"]) / "_work"
     work = tmp_root / dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     work.mkdir(parents=True, exist_ok=True)
@@ -1235,6 +1260,7 @@ def process(source: str, cfg: dict, local: bool, credit: str = "", local_title: 
         tmp_root.rmdir()
     except OSError:
         pass
+    log("Gemini model used: " + (", ".join(sorted(GEMINI_USED)) if GEMINI_USED else "none (automatic picks)"))
     log(f"Finished in {(time.time() - t0) / 60:.1f} min -> {folder}")
     return folder
 

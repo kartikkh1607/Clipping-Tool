@@ -93,7 +93,8 @@ Use `--lang hi` (or answer `hi` in `run_clipper.bat`). Whisper transcribes in Hi
 | `hinglish_roman_captions` | true | Hindi only: Gemini rewrites Devanagari caption words in Roman Hinglish ("bhai ye kya scene hai"), keeping English words and word timings. Without a key, or if the call fails, captions stay in Devanagari |
 | `cookies_from_browser` | "" | set to `"chrome"` if a video needs sign-in (age-restricted) |
 | `pot_provider` | true | start the bgutil PO Token server before YouTube downloads (set false when using `cookies_from_browser`; the two are never combined) |
-| `gemini_fallback_models` | 3.7-flash, 3.5-flash, 3.5-flash-lite | tried in order when `gemini_model` is busy or times out |
+| `gemini_model` | gemini-3.5-flash-lite | free tier: 500 requests/day, 15/min |
+| `gemini_fallback_models` | 3.6-flash, 3.8-flash | free tier: 20/day, 5/min each. A 429 (quota used up) jumps straight to the next model; a 503 (overloaded) waits and retries. All Gemini calls are queued at most 14 per minute. The log shows which model answered |
 | `keep_source` | false | keep the full downloaded video |
 
 ## If something breaks
