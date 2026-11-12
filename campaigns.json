@@ -1,0 +1,27 @@
+{
+  "skiimasktimmy": {
+    "campaign_name": "SkiiMaskTimmy Streamer Campaign",
+    "creator_name": "SkiiMaskTimmy",
+    "source_platform": "twitch",
+    "source_channel": "skiimasktimmy",
+    "overlay_image": "overlays/skiimasktimmy.png",
+    "layout": "facecam",
+    "facecam_box": [986, 516, 276, 148],
+    "facecam_ref": [1280, 720],
+    "language": "en",
+    "min_clip_seconds": 20,
+    "max_clip_seconds": 45,
+    "num_clips": 5,
+    "required_text": "twitch.tv/skiimasktimmy",
+    "campaign_hashtags": ["skiimasktimmy", "twitchclips", "fps", "gaming"],
+    "approved_formats": [
+      "clutch play (open on the payoff)",
+      "extraction tension",
+      "funny moment / fail / rage",
+      "first impression / hot take on a new game (hot take as on-screen text)",
+      "genuine reaction / jump scare",
+      "chat banter / challenge"
+    ],
+    "post_note": "Post at US prime time: 5:30-9:30 AM IST"
+  }
+}

@@ -6,10 +6,24 @@ pip install -q -U yt-dlp[default] >nul 2>nul
 :loop
 echo.
 set "URL="
-set /p URL=Paste YouTube link (or press Enter to quit):
+set /p URL=Paste YouTube or Twitch link (or press Enter to quit): 
 if "%URL%"=="" exit /b 0
+set "CAMP=none"
+set /p CAMP=Campaign (skiimasktimmy / none) [none]: 
+set "ARGS="
+if /i "%CAMP%"=="none" goto asklang
+set "ARGS=--campaign %CAMP%"
+goto asksection
+:asklang
 set "CLIPLANG=en"
-set /p CLIPLANG=Language (en/hi) [en]:
+set /p CLIPLANG=Language (en/hi) [en]: 
 if /i not "%CLIPLANG%"=="hi" set "CLIPLANG=en"
-python clipper.py "%URL%" --lang %CLIPLANG%
+set "ARGS=--lang %CLIPLANG%"
+:asksection
+echo "%URL%" | find /i "twitch.tv/videos" >nul || goto run
+set "SECTION="
+set /p SECTION=Section (e.g. 0:30:00-2:00:00, Enter = whole VOD): 
+if not "%SECTION%"=="" set "ARGS=%ARGS% --section %SECTION%"
+:run
+python clipper.py "%URL%" %ARGS%
 goto loop

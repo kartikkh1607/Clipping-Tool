@@ -49,6 +49,8 @@ DEFAULTS = {
     "whisper_model": "large-v3-turbo",   # GPU model
     "whisper_cpu_model": "small",        # used if the GPU fails
     "whisper_device": "auto",            # auto | cuda | cpu
+    "whisper_batch_size": 8,             # GPU batched transcription (1 = off); lower it if the GPU runs out of memory
+    "render_workers": 2,                 # clips rendered at the same time
     "language": "en",                    # en | hi | "" (auto-detect)
     "hindi_caption_font": "Nirmala UI",  # supports Devanagari
     "hinglish_roman_captions": True,     # hi: transliterate captions to Roman Hinglish via Gemini
@@ -63,7 +65,19 @@ DEFAULTS = {
     "skip_start_seconds": 10,            # avoid intros
     "skip_end_seconds": 20,              # avoid outros / "subscribe"
     "keep_source": False,                # keep the downloaded full video
+    "twitch_max_height": 720,            # Twitch VODs are hours long: cap the download
+    "overlay_image": "",                 # PNG burned on every clip (transparency kept)
+    "overlay_width_pct": 85,             # overlay width as % of 1080
+    "facecam_box": None,                 # [x, y, w, h] in facecam_ref pixels, for layout "facecam"
+    "facecam_ref": [1280, 720],          # source resolution the facecam box was measured on
 }
+CAMPAIGNS_PATH = HERE / "campaigns.json"
+
+# facecam layout (1080x1920): facecam on top, overlay band, gameplay below
+FC_CAM_H = 720
+FC_BAND_H = 160
+FC_GAME_Y = FC_CAM_H + FC_BAND_H
+FC_BAND_COLOR = "0x0E0B16"
 
 PROMO_WORDS = [
     "sponsor", "sponsored", "use code", "promo code", "link in the description",
@@ -102,6 +116,30 @@ def fmt_ts(sec: float) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
+def parse_time(t: str) -> float:
+    parts = [float(p) for p in t.strip().split(":")]
+    return sum(p * 60 ** i for i, p in enumerate(reversed(parts)))
+
+
+def parse_section(text: str) -> tuple[float, float]:
+    """"0:30:00-2:00:00" -> (1800.0, 7200.0)"""
+    m = re.fullmatch(r"\s*([\d:.]+)\s*-\s*([\d:.]+)\s*", text or "")
+    if not m:
+        sys.exit(f"ERROR: --section must look like 0:30:00-2:00:00, got '{text}'")
+    a, b = parse_time(m.group(1)), parse_time(m.group(2))
+    if b <= a:
+        sys.exit("ERROR: --section end must be after its start")
+    return a, b
+
+
+def is_youtube(url: str) -> bool:
+    return "youtu" in url
+
+
+def is_twitch(url: str) -> bool:
+    return "twitch.tv" in url
+
+
 def run(cmd: list[str], cwd: Path | None = None, quiet: bool = True) -> subprocess.CompletedProcess:
     res = subprocess.run(cmd, cwd=str(cwd) if cwd else None, capture_output=True, text=True,
                          encoding="utf-8", errors="replace")
@@ -120,6 +158,23 @@ def load_config(args) -> dict:
             log(f"WARNING: could not read config.json ({e}); using defaults")
     if not cfg.get("gemini_api_key"):
         cfg["gemini_api_key"] = os.environ.get("GEMINI_API_KEY", "")
+    cfg["campaign"] = ""
+    if args.campaign and args.campaign.lower() != "none":
+        presets = json.loads(CAMPAIGNS_PATH.read_text(encoding="utf-8")) if CAMPAIGNS_PATH.exists() else {}
+        name = args.campaign.lower()
+        if name not in presets:
+            sys.exit(f"ERROR: campaign '{args.campaign}' not found in campaigns.json ({', '.join(presets) or 'none defined'})")
+        cfg.update(presets[name])
+        cfg["campaign"] = name
+        log(f"Campaign preset: {name}")
+    if args.overlay_image:
+        cfg["overlay_image"] = args.overlay_image
+    if cfg.get("overlay_image"):
+        p = Path(cfg["overlay_image"])
+        cfg["overlay_image"] = str(p if p.is_absolute() else HERE / p)
+        if not Path(cfg["overlay_image"]).exists():
+            sys.exit(f"ERROR: overlay image not found: {cfg['overlay_image']}")
+    cfg["section"] = parse_section(args.section) if args.section else None
     if args.out:
         cfg["output_root"] = args.out
     if args.clips:
@@ -196,8 +251,12 @@ def download(url: str, work: Path, cfg: dict) -> tuple[Path, dict]:
     import yt_dlp
 
     h = int(cfg["max_download_height"])
+    fmt = f"bv*[height<={h}][ext=mp4]+ba[ext=m4a]/bv*[height<={h}]+ba/b[height<={h}]/b"
+    if is_twitch(url):  # Twitch HLS formats already contain audio
+        h = min(h, int(cfg["twitch_max_height"]))
+        fmt = f"b[height<={h}]/b"
     opts = {
-        "format": f"bv*[height<={h}][ext=mp4]+ba[ext=m4a]/bv*[height<={h}]+ba/b[height<={h}]/b",
+        "format": fmt,
         "merge_output_format": "mp4",
         "outtmpl": str(work / "source.%(ext)s"),
         "quiet": True,
@@ -211,13 +270,30 @@ def download(url: str, work: Path, cfg: dict) -> tuple[Path, dict]:
     }
     if cfg.get("verbose"):
         opts.update({"verbose": True, "quiet": False})
-    if cfg.get("pot_provider") and "youtu" in url:
-        ensure_pot_provider(cfg)
-        opts["extractor_args"] = {"youtubepot-bgutilhttp": {"base_url": [f"http://127.0.0.1:{int(cfg['pot_provider_port'])}"]}}
-        if cfg.get("cookies_from_browser"):
-            log("Note: cookies_from_browser is ignored while pot_provider is on")
-    elif cfg.get("cookies_from_browser"):
-        opts["cookiesfrombrowser"] = (cfg["cookies_from_browser"],)
+    if is_youtube(url):  # YouTube-only: bot check workarounds
+        if cfg.get("pot_provider"):
+            ensure_pot_provider(cfg)
+            opts["extractor_args"] = {"youtubepot-bgutilhttp": {"base_url": [f"http://127.0.0.1:{int(cfg['pot_provider_port'])}"]}}
+            if cfg.get("cookies_from_browser"):
+                log("Note: cookies_from_browser is ignored while pot_provider is on")
+        elif cfg.get("cookies_from_browser"):
+            opts["cookiesfrombrowser"] = (cfg["cookies_from_browser"],)
+    section = cfg.get("section")
+    pre = {}
+    if cfg.get("campaign") or section:  # metadata first: check the source and the VOD length before downloading
+        with yt_dlp.YoutubeDL({**opts, "quiet": True}) as ydl:
+            pre = ydl.extract_info(url, download=False)
+        check_campaign_source(url, pre, cfg)
+    full = float(pre.get("duration") or 0)
+    if section and full and section[0] >= full:
+        raise RuntimeError(f"--section starts at {fmt_ts(section[0])} but the video is only {fmt_ts(full)} long")
+    if section and full and (section[0] > 0 or section[1] < full):
+        a, b = section[0], min(section[1], full)
+        section = (a, b)
+        log(f"Downloading only {fmt_ts(a)}-{fmt_ts(b)}")
+        opts["download_ranges"] = yt_dlp.utils.download_range_func(None, [(a, b)])
+    else:
+        section = None
     for attempt in range(1, 4):  # flaky connections: resume the .part file a few times
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -246,8 +322,29 @@ def download(url: str, work: Path, cfg: dict) -> tuple[Path, dict]:
         "duration": float(info.get("duration") or 0),
         "heatmap": info.get("heatmap") or [],
         "view_count": info.get("view_count"),
+        "offset": section[0] if section else 0.0,  # clip times + offset = time in the original video
+        "chapters": info.get("chapters") or [],
+        "twitch": is_twitch(url),
     }
+    if section:  # the file is only the section; its own length is what we process
+        meta["duration"] = probe_duration(path)
+        meta["heatmap"] = [{**p, "start_time": p["start_time"] - section[0], "end_time": p["end_time"] - section[0]}
+                           for p in meta["heatmap"] if p.get("end_time", 0) > section[0] and p.get("start_time", 0) < section[1]]
     return path, meta
+
+
+def check_campaign_source(url: str, info: dict, cfg: dict) -> None:
+    """Campaign footage rules: refuse sources from the wrong platform or channel."""
+    if not cfg.get("campaign"):
+        return
+    plat, chan = cfg.get("source_platform"), (cfg.get("source_channel") or "").lower()
+    if plat == "twitch" and not is_twitch(url):
+        raise RuntimeError(f"Campaign '{cfg['campaign']}' only allows Twitch footage, not: {url}")
+    if chan:
+        ids = {str(info.get(k) or "").lower() for k in ("uploader_id", "channel_id", "channel", "uploader")}
+        if chan not in ids:
+            raise RuntimeError(f"Campaign '{cfg['campaign']}' only allows footage from '{chan}', "
+                               f"this video is from '{info.get('uploader') or info.get('channel')}'")
 
 
 def probe_duration(path: Path) -> float:
@@ -269,6 +366,80 @@ def has_audio(path: Path) -> bool:
     return bool(res.stdout.strip())
 
 
+# ----------------------------------------------------------------------------- facecam
+def find_facecam(url: str, cfg: dict, at: float = 600.0) -> Path:
+    """Save a frame from ~10 min in with a labelled pixel grid, to read the facecam box from."""
+    import yt_dlp
+
+    with yt_dlp.YoutubeDL({"quiet": True, "format": f"b[height<={int(cfg['twitch_max_height'])}]/b"}) as ydl:
+        info = ydl.extract_info(url, download=False)
+    at = min(at, float(info.get("duration") or at * 2) / 2)
+    out = HERE / "facecam_check.png"
+    tmp = HERE / "_facecam_raw.png"
+    run(["ffmpeg", "-y", "-v", "error", "-ss", f"{at:.0f}", "-i", info["url"], "-frames:v", "1", str(tmp)])
+    w, h = probe_size(tmp)
+    labels = []
+    for x in range(0, w, 80):
+        labels.append(f"Dialogue: 0,0:00:00.00,0:00:01.00,L,,0,0,0,,{{\\an7\\pos({x + 2},2)}}{x}")
+    for y in range(80, h, 80):
+        labels.append(f"Dialogue: 0,0:00:00.00,0:00:01.00,L,,0,0,0,,{{\\an7\\pos(2,{y + 2})}}{y}")
+    (HERE / "_grid.ass").write_text(f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {w}
+PlayResY: {h}
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: L,Arial,{max(12, h // 50)},&H0000FFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,2,0,7,0,0,0,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+""" + "\n".join(labels) + "\n", encoding="utf-8")
+    run(["ffmpeg", "-y", "-v", "error", "-i", tmp.name, "-vf",
+         "drawgrid=w=40:h=40:t=1:c=white@0.25,drawgrid=w=80:h=80:t=1:c=yellow@0.7,ass=_grid.ass",
+         "-frames:v", "1", out.name], cwd=HERE)
+    tmp.unlink(missing_ok=True)
+    (HERE / "_grid.ass").unlink(missing_ok=True)
+    log(f"Saved {out} ({w}x{h}, frame at {fmt_ts(at)} of '{info.get('title')}'). Read the facecam box "
+        f"as x,y,w,h in these pixels and put it in campaigns.json -> facecam_box (facecam_ref [{w}, {h}]).")
+    return out
+
+
+def facecam_crop(cfg: dict, src_w: int, src_h: int) -> tuple[int, int, int, int] | None:
+    """Facecam box scaled to the source and trimmed (centered) to the 1080x720 slot's aspect.
+    Trimming instead of widening keeps stream overlay borders/widgets around the cam out of the shot."""
+    box = cfg.get("facecam_box")
+    if not box:
+        return None
+    rw, rh = cfg.get("facecam_ref") or [src_w, src_h]
+    sx, sy = src_w / rw, src_h / rh
+    x, y, w, h = box[0] * sx, box[1] * sy, box[2] * sx, box[3] * sy
+    target = 1080 / FC_CAM_H
+    if w / h > target:
+        nw = h * target
+        x, w = x + (w - nw) / 2, nw
+    else:
+        nh = w / target
+        y, h = y + (h - nh) / 2, nh
+    if x < 0 or y < 0 or x + w > src_w or y + h > src_h:
+        return None
+    even = lambda v: int(v) // 2 * 2
+    return even(x), even(y), even(w), even(h)
+
+
+def facecam_visible(src: Path, crop: tuple, times: list[float]) -> bool:
+    """True if the facecam area shows a live picture (not black/frozen) in at least one sample."""
+    x, y, w, h = crop
+    for t in times:
+        res = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{t:.1f}", "-i", str(src), "-frames:v", "1",
+                              "-vf", f"crop={w}:{h}:{x}:{y},scale=64:64,format=gray", "-f", "rawvideo", "-"],
+                             capture_output=True)
+        px = np.frombuffer(res.stdout, dtype=np.uint8)
+        if px.size == 64 * 64 and px.std() > 12 and 15 < px.mean() < 245:
+            return True
+    return False
+
+
 # ----------------------------------------------------------------------------- transcription
 def _add_nvidia_dll_dirs() -> None:
     """On Windows, make the pip-installed CUDA libraries (cuBLAS/cuDNN) findable."""
@@ -286,17 +457,20 @@ def _add_nvidia_dll_dirs() -> None:
         pass
 
 
-def _transcribe_child(wav: str, out_json: str, device: str, model_name: str, language: str) -> None:
+def _transcribe_child(wav: str, out_json: str, device: str, model_name: str, language: str,
+                      batch_size: str = "1") -> None:
     """Runs in a separate process so a CUDA crash can't kill the main pipeline."""
     _add_nvidia_dll_dirs()
-    from faster_whisper import WhisperModel
+    from faster_whisper import BatchedInferencePipeline, WhisperModel
 
     compute = "float16" if device == "cuda" else "int8"
     model = WhisperModel(model_name, device=device, compute_type=compute)
-    segments, info = model.transcribe(
-        wav, language=language or None, word_timestamps=True, vad_filter=True, beam_size=5,
-        condition_on_previous_text=False,
-    )
+    opts = dict(language=language or None, word_timestamps=True, vad_filter=True, beam_size=5,
+                condition_on_previous_text=False)
+    if int(batch_size) > 1:  # GPU: decode several speech chunks at once (much faster on long videos)
+        segments, info = BatchedInferencePipeline(model).transcribe(wav, batch_size=int(batch_size), **opts)
+    else:
+        segments, info = model.transcribe(wav, **opts)
     out = {"language": info.language, "segments": []}
     for seg in segments:
         words = [[float(w.start), float(w.end), w.word] for w in (seg.words or [])]
@@ -310,18 +484,23 @@ def transcribe(wav: Path, work: Path, cfg: dict) -> dict:
     out_json = work / "transcript.json"
     attempts = []
     dev = cfg["whisper_device"]
+    bs = int(cfg.get("whisper_batch_size") or 1)
     if dev in ("auto", "cuda"):
-        attempts.append(("cuda", cfg["whisper_model"]))
+        attempts.append(("cuda", cfg["whisper_model"], bs))
+        if bs > 1:  # e.g. out of GPU memory: retry unbatched on the GPU before the slow CPU
+            attempts.append(("cuda", cfg["whisper_model"], 1))
     if dev in ("auto", "cpu"):
-        attempts.append(("cpu", cfg["whisper_cpu_model"]))
-    for device, model in attempts:
-        log(f"Transcribing on {device.upper()} with '{model}' (first run downloads the model)...")
+        attempts.append(("cpu", cfg["whisper_cpu_model"], 1))
+    for n, (device, model, b) in enumerate(attempts):
+        log(f"Transcribing on {device.upper()} with '{model}'" + (f", batch {b}" if b > 1 else "")
+            + " (first run downloads the model)...")
         cmd = [sys.executable, str(Path(__file__).resolve()), "--_transcribe", str(wav),
-               str(out_json), device, model, cfg.get("language") or ""]
+               str(out_json), device, model, cfg.get("language") or "", str(b)]
         res = subprocess.run(cmd)
         if res.returncode == 0 and out_json.exists():
             return json.loads(out_json.read_text(encoding="utf-8"))
-        log(f"Transcription on {device} failed" + (" - falling back to CPU" if device == "cuda" else ""))
+        nxt = attempts[n + 1] if n + 1 < len(attempts) else None
+        log(f"Transcription on {device} failed" + (f" - retrying on {nxt[0].upper()}" if nxt else ""))
     log("WARNING: no transcript - clips will be picked by audio/heatmap only, without captions.")
     return {"language": "", "segments": []}
 
@@ -509,17 +688,39 @@ def gemini_pick(pool: list[dict], segments: list, meta: dict, cfg: dict) -> list
     if cfg.get("_lang") == "hi":
         lang_note = ("\nThe video is in Hindi/Hinglish. Write title, banner and description in Hinglish using "
                      "Roman script only (e.g. \"bhai ye kya scene hai\"), never Devanagari. Keep English words in English.\n")
+    camp_note, camp_fields = "", ""
+    if cfg.get("campaign"):
+        formats = "\n".join(f"  - {f}" for f in cfg.get("approved_formats", []))
+        camp_note = f"""
+CAMPAIGN RULES ({cfg.get('campaign_name', cfg['campaign'])}) - clips outside these rules get rejected:
+- Only pick moments that clearly fit one of these approved formats, nothing else:
+{formats}
+- Skip menus, loading screens, giveaway/key/sponsor talk, idle chatting and anything that needs context.
+- Clutch plays: start right before the decisive action so the payoff comes in the first seconds.
+- First impressions/hot takes: the banner states his hot take in a few words.
+- banner: a short, punchy gaming hook of at most 6 words, like "HE DID NOT SEE THAT COMING" or
+  "WORST TEAMMATE EVER". Never a sentence, explanation or description.
+- format: which approved format the clip is. game: the game being played (from the transcript,
+  the video title or game_hint), e.g. "Bodycam".
+"""
+        camp_fields = ', "format": str, "game": str'
+    heat_note = ("" if any(c["heat"] for c in pool) else
+                 '\n"most_replayed" is not available for this source (always 0); rely on loudness and the transcript.')
     items = []
     for i, c in enumerate(pool):
-        items.append({
+        item = {
             "id": i, "start": c["start"], "end": c["end"],
             "most_replayed": round(c["heat"], 2), "loudness": round(c["loud"], 2),
             "transcript": text_in(segments, max(0, c["start"] - 10), c["end"] + 10)[:1500],
-        })
+        }
+        if chapter_at(meta, c["start"]):  # Twitch only
+            item["game_hint"] = chapter_at(meta, c["start"])
+        items.append(item)
     prompt = f"""You are an expert short-form video editor for a gaming clips channel.
 Source video: "{meta['title']}" by {meta['channel']}.
 Below are candidate moments (seconds). "most_replayed" (0-1) is YouTube's real replay heatmap;
-"loudness" (0-1) is how loud/hype the audio is. Transcript covers 10 s before and after each candidate.
+"loudness" (0-1) is how loud/hype the audio is. Transcript covers 10 s before and after each candidate.{heat_note}
+{camp_note}
 
 Pick the {k} BEST moments that work as standalone Shorts: a genuine funny, hype, clutch, rage,
 or shocking moment that makes sense without context. Prefer high most_replayed. Skip sponsor reads,
@@ -535,7 +736,7 @@ For each clip write:
 - reason: why this moment is strong
 {lang_note}
 Return JSON: {{"clips": [{{"id": int, "start": float, "end": float, "title": str, "banner": str,
-"description": str, "hashtags": [str], "reason": str}}]}} ordered best first.
+"description": str, "hashtags": [str], "reason": str{camp_fields}}}]}} ordered best first.
 
 Candidates:
 {json.dumps(items, ensure_ascii=False)}"""
@@ -565,7 +766,10 @@ Candidates:
                         "title": str(c.get("title", ""))[:100], "banner": str(c.get("banner", ""))[:60],
                         "description": str(c.get("description", "")),
                         "hashtags": [str(h).lstrip("#").replace(" ", "") for h in c.get("hashtags", [])][:8],
-                        "reason": str(c.get("reason", ""))})
+                        "reason": str(c.get("reason", "")),
+                        "format": str(c.get("format", "")), "game": str(c.get("game", ""))})
+            if cfg.get("campaign"):  # hard cap: banners are hooks, not sentences
+                out[-1]["banner"] = " ".join(out[-1]["banner"].split()[:6])
         except Exception:
             continue
         if len(out) >= k:
@@ -610,6 +814,29 @@ Input: {json.dumps(part, ensure_ascii=False)}"""
                 lead = orig[: len(orig) - len(orig.lstrip())]
                 out[i + j][2] = lead + r
     return out
+
+
+def chapter_at(meta: dict, t: float) -> str:
+    """Twitch VOD chapters are the game being played; t is in clip/file time."""
+    if not meta.get("twitch"):
+        return ""
+    t += meta.get("offset", 0)
+    for ch in meta.get("chapters") or []:
+        if ch.get("start_time", 0) <= t < ch.get("end_time", float("inf")):
+            return ch.get("title") or ""
+    return ""
+
+
+def source_link(meta: dict, t: float) -> str:
+    """Link to the original video at time t (file time; the --section offset is added)."""
+    t = int(t + meta.get("offset", 0))
+    link = meta["url"]
+    if meta.get("id") and "youtu" in link:
+        return f"https://www.youtube.com/watch?v={meta['id']}&t={t}s"
+    m = re.search(r"twitch\.tv/videos/(\d+)", link)
+    if m:
+        return f"https://www.twitch.tv/videos/{m.group(1)}?t={t // 3600}h{t % 3600 // 60}m{t % 60}s"
+    return link
 
 
 def fallback_text(clip: dict, segments: list, meta: dict) -> None:
@@ -670,9 +897,12 @@ def chunk_words(words: list, per: int) -> list[list]:
 def write_captions(clip: dict, segments: list, cfg: dict, ass_path: Path, srt_path: Path) -> None:
     s0, s1 = clip["start"], clip["end"]
     dur = s1 - s0
-    blur = cfg["layout"] == "blur"
+    layout = cfg.get("_layout") or cfg["layout"]
+    blur = layout == "blur"
     cap_margin = 420 if blur else 560
     banner_margin = 300 if blur else 180
+    if layout == "facecam":  # banner at the top of the gameplay, captions over its lower part
+        cap_margin, banner_margin = 330, FC_GAME_Y + 25
     hindi = cfg.get("_lang") == "hi"
     font = cfg["hindi_caption_font"] if hindi else cfg["caption_font"]
     size = int(cfg["caption_size"])
@@ -738,25 +968,69 @@ def pick_encoder() -> list[str]:
     return _ENCODER
 
 
+def overlay_geometry(cfg: dict, layout: str) -> tuple[int, int, int] | None:
+    """(width, height, y) of the overlay image in the 1080x1920 frame, clear of cam, gameplay and captions."""
+    if not cfg.get("overlay_image"):
+        return None
+    iw, ih = probe_size(Path(cfg["overlay_image"]))
+    w = int(round(1080 * float(cfg["overlay_width_pct"]) / 100 / 2) * 2)
+    h = int(round(w * ih / iw / 2) * 2)
+    if layout == "facecam":   # in the band between facecam and gameplay
+        h = min(h, FC_BAND_H - 6)
+        w = int(round(h * iw / ih / 2) * 2) if h < round(w * ih / iw) else w
+        y = FC_CAM_H + (FC_BAND_H - h) // 2
+    elif layout == "crop":    # bottom edge, below the captions
+        y = 1920 - h - 80
+    else:                     # blur: below the gameplay and captions (the banner sits above the gameplay)
+        y = 1540
+    return w, h, y
+
+
 def render_clip(src: Path, clip: dict, folder: Path, base: str, cfg: dict, audio: bool) -> Path:
     ass_name = f"{base}.ass"
     out_name = f"{base}.mp4"
-    if cfg["layout"] == "crop":
-        vf = f"scale=-2:1920,crop=1080:1920,ass={ass_name}"
+    layout = cfg.get("_layout") or cfg["layout"]
+    if layout == "facecam":
+        sw, sh = probe_size(src)
+        x, y, w, h = cfg["_facecam"]
+        game_h = 1920 - FC_GAME_Y
+        gw = min(sw, int(sh * 1080 / game_h) // 2 * 2)
+        gx = (sw - gw) // 2
+        rw = (cfg.get("facecam_ref") or [sw, sh])[0]
+        bx, bw = cfg["facecam_box"][0] * sw / rw, cfg["facecam_box"][2] * sw / rw
+        pad = 16 * sw / rw       # the cam's frame/border around the box
+        if bx + bw / 2 > sw / 2:  # cam on the right: keep it (and its frame) out of the gameplay crop
+            gx = max(0, min(gx, int(bx - pad) - gw))
+        else:
+            gx = min(sw - gw, max(gx, int(bx + bw + pad)))
+        chain = (f"[0:v]split=2[cam][game];"
+                 f"[cam]crop={w}:{h}:{x}:{y},scale=1080:{FC_CAM_H}:flags=lanczos,unsharp=5:5:0.6,"
+                 f"pad=1080:1920:0:0:color={FC_BAND_COLOR}[base];"
+                 f"[game]crop={gw}:{sh}:{gx}:0,scale=1080:{game_h}:force_original_aspect_ratio=increase,"
+                 f"crop=1080:{game_h}[g];"
+                 f"[base][g]overlay=0:{FC_GAME_Y}[v0]")
+    elif layout == "crop":
+        chain = "[0:v]scale=-2:1920,crop=1080:1920[v0]"
     else:
         z = float(cfg.get("zoom", 1.0))
         fw = int(round(1080 * z / 2) * 2)
-        vf = (f"split=2[a][b];"
-              f"[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
-              f"boxblur=20:2,eq=brightness=-0.10[bg];"
-              f"[b]scale={fw}:-2,crop=min(iw\\,1080):ih[fg];"
-              f"[bg][fg]overlay=(W-w)/2:(H-h)/2,ass={ass_name}")
+        chain = (f"[0:v]split=2[a][b];"
+                 f"[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
+                 f"boxblur=20:2,eq=brightness=-0.10[bg];"
+                 f"[b]scale={fw}:-2,crop=min(iw\\,1080):ih[fg];"
+                 f"[bg][fg]overlay=(W-w)/2:(H-h)/2[v0]")
+    ov = overlay_geometry(cfg, layout)
+    if ov:
+        chain += f";[1:v]scale={ov[0]}:{ov[1]}[ov];[v0][ov]overlay=(W-w)/2:{ov[2]}[v1]"
+    chain += f";[{'v1' if ov else 'v0'}]ass={ass_name}[vout]"
     dur = clip["end"] - clip["start"]
-    cmd = ["ffmpeg", "-y", "-v", "error", "-ss", f"{clip['start']:.2f}", "-i", str(src),
-           "-t", f"{dur:.2f}", "-filter_complex" if cfg["layout"] != "crop" else "-vf", vf,
-           *pick_encoder(), "-pix_fmt", "yuv420p", "-r", "30"]
-    if audio:
-        cmd += ["-af", "loudnorm=I=-14:TP=-1.5:LRA=11", "-c:a", "aac", "-b:a", "160k", "-ar", "48000"]
+    cmd = ["ffmpeg", "-y", "-v", "error", "-ss", f"{clip['start']:.2f}", "-i", str(src)]
+    if ov:
+        cmd += ["-i", cfg["overlay_image"]]
+    cmd += ["-t", f"{dur:.2f}", "-filter_complex", chain, "-map", "[vout]",
+            *pick_encoder(), "-pix_fmt", "yuv420p", "-r", "30"]
+    if audio:  # the stream's own audio only, loudness-normalised; nothing is ever mixed in
+        cmd += ["-map", "0:a:0", "-af", "loudnorm=I=-14:TP=-1.5:LRA=11", "-c:a", "aac", "-b:a", "160k", "-ar", "48000"]
     else:
         cmd += ["-an"]
     cmd += ["-movflags", "+faststart", out_name]
@@ -777,12 +1051,42 @@ def render_clip(src: Path, clip: dict, folder: Path, base: str, cfg: dict, audio
     return folder / out_name
 
 
+def game_tag(game: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (game or "").lower().replace("&", "and"))
+
+
+def write_campaign_details(clip: dict, rank: int, meta: dict, cfg: dict, path: Path) -> None:
+    tags = list(cfg.get("campaign_hashtags", []))
+    game = clip.get("game") or chapter_at(meta, clip["start"])
+    if game_tag(game) and game_tag(game) not in tags:
+        tags.append(game_tag(game))
+    t0, t1 = clip["start"] + meta.get("offset", 0), clip["end"] + meta.get("offset", 0)
+    body = f"""TITLE
+{clip['title']}
+
+CAPTION
+{clip['title']} | {cfg['required_text']}
+{' '.join('#' + h for h in tags)}
+
+SOURCE
+{source_link(meta, clip['start'])}
+VOD time: {fmt_ts(t0)} - {fmt_ts(t1)}  ({clip['end'] - clip['start']:.0f}s)
+
+{cfg.get('post_note', '')}
+
+--- info (not for upload) ---
+Rank: {rank} (1 = strongest)
+Format: {clip.get('format') or 'auto pick (no Gemini)'}   Game: {game or 'unknown'}
+Banner: {clip.get('banner', '')}
+Loudness score: {clip['loud']:.2f}
+Why: {clip['reason']}
+"""
+    path.write_text(body, encoding="utf-8")
+
+
 def write_details(clip: dict, rank: int, meta: dict, path: Path) -> None:
     tags = " ".join("#" + h for h in clip["hashtags"])
-    t = int(clip["start"])
-    link = meta["url"]
-    if meta.get("id") and "youtu" in link:
-        link = f"https://www.youtube.com/watch?v={meta['id']}&t={t}s"
+    link = source_link(meta, clip["start"])
     credit = f"Credit: {meta['channel']}" + (f" ({meta['channel_url']})" if meta.get("channel_url") else "")
     body = f"""TITLE
 {clip['title']}
@@ -800,7 +1104,7 @@ HASHTAGS
 
 --- info (not for upload) ---
 Rank: {rank} (1 = strongest)
-Source time: {fmt_ts(clip['start'])} - {fmt_ts(clip['end'])}  ({clip['end'] - clip['start']:.0f}s)
+Source time: {fmt_ts(clip['start'] + meta.get('offset', 0))} - {fmt_ts(clip['end'] + meta.get('offset', 0))}  ({clip['end'] - clip['start']:.0f}s)
 Most-replayed score: {clip['heat']:.2f}   Loudness score: {clip['loud']:.2f}
 Why: {clip['reason']}
 """
@@ -828,13 +1132,16 @@ def process(source: str, cfg: dict, local: bool, credit: str = "", local_title: 
         if not src.exists():
             raise FileNotFoundError(src)
         meta = {"title": local_title or src.stem, "channel": credit or "creator", "channel_url": "",
-                "url": "", "id": "", "duration": probe_duration(src), "heatmap": [], "view_count": None}
+                "url": "", "id": "", "duration": probe_duration(src), "heatmap": [], "view_count": None,
+                "offset": 0.0, "chapters": [], "twitch": False}
         log(f"Using local file: {src.name}")
     else:
         log(f"Downloading: {source}")
         src, meta = download(source, work, cfg)
         if not meta["duration"]:
             meta["duration"] = probe_duration(src)
+        if cfg.get("creator_name"):
+            meta["channel"] = cfg["creator_name"]
         log(f"Got '{meta['title']}' by {meta['channel']} ({fmt_ts(meta['duration'])})"
             + ("  [Most-replayed heatmap found]" if meta["heatmap"] else "  [no heatmap - using audio/speech only]"))
 
@@ -888,18 +1195,38 @@ def process(source: str, cfg: dict, local: bool, credit: str = "", local_title: 
     folder = make_video_folder(cfg, meta)
     log(f"Rendering {len(clips)} clips -> {folder}")
     summary = [f"{meta['title']}  —  {meta['channel']}", meta["url"], ""]
-    for rank, clip in enumerate(clips, 1):
+    off = meta.get("offset", 0)
+    cam = facecam_crop(cfg, *probe_size(src)) if cfg["layout"] == "facecam" else None
+    if cfg["layout"] == "facecam" and not cam:
+        log("No usable facecam box for this video - using the blur layout (full frame keeps the facecam visible)")
+    pick_encoder()
+
+    def render_one(rank: int, clip: dict) -> str:
+        ccfg = {**cfg, "_layout": cfg["layout"], "_facecam": cam}  # per clip: renders run in parallel
+        if cfg["layout"] == "facecam":
+            mid = (clip["start"] + clip["end"]) / 2
+            if not cam or not facecam_visible(src, cam, [clip["start"] + 2, mid, clip["end"] - 2]):
+                if cam:
+                    log(f"  clip {rank}: facecam not found in its box - using the blur layout")
+                ccfg["_layout"] = "blur"
         base = f"{rank:02d}_{slugify(clip['title'], 45)}"
-        write_captions(clip, segments, cfg, folder / f"{base}.ass", folder / f"{base}.srt")
-        render_clip(src, clip, folder, base, cfg, audio)
-        write_details(clip, rank, meta, folder / f"{base}.txt")
+        write_captions(clip, segments, ccfg, folder / f"{base}.ass", folder / f"{base}.srt")
+        render_clip(src, clip, folder, base, ccfg, audio)
+        if cfg.get("campaign"):
+            write_campaign_details(clip, rank, meta, ccfg, folder / f"{base}.txt")
+        else:
+            write_details(clip, rank, meta, folder / f"{base}.txt")
         (folder / f"{base}.ass").unlink(missing_ok=True)
-        summary.append(f"{rank:02d}. [{fmt_ts(clip['start'])}-{fmt_ts(clip['end'])}] {clip['title']}")
         log(f"  {rank}/{len(clips)} done: {clip['title']}")
+        return f"{rank:02d}. [{fmt_ts(clip['start'] + off)}-{fmt_ts(clip['end'] + off)}] {clip['title']}"
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max(1, int(cfg.get("render_workers") or 1))) as ex:
+        summary += list(ex.map(lambda a: render_one(*a), enumerate(clips, 1)))
     (folder / "_summary.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
     if segments:
         (folder / "_transcript.txt").write_text(
-            "\n".join(f"[{fmt_ts(s['start'])}] {s['text']}" for s in segments), encoding="utf-8")
+            "\n".join(f"[{fmt_ts(s['start'] + off)}] {s['text']}" for s in segments), encoding="utf-8")
 
     if cfg.get("keep_source") and not local:
         shutil.move(str(src), str(folder / f"_source{src.suffix}"))
@@ -914,10 +1241,10 @@ def process(source: str, cfg: dict, local: bool, credit: str = "", local_title: 
 
 def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "--_transcribe":
-        _transcribe_child(*sys.argv[2:7])
+        _transcribe_child(*sys.argv[2:8])
         return
-    ap = argparse.ArgumentParser(description="YouTube link -> best moments as vertical captioned clips")
-    ap.add_argument("urls", nargs="*", help="YouTube link(s)")
+    ap = argparse.ArgumentParser(description="YouTube/Twitch link -> best moments as vertical captioned clips")
+    ap.add_argument("urls", nargs="*", help="YouTube or Twitch (VOD / clip) link(s)")
     ap.add_argument("--list", help="text file with one link per line")
     ap.add_argument("--file", help="use a local video file instead of a link")
     ap.add_argument("--credit", default="", help="creator name for a local file")
@@ -927,16 +1254,24 @@ def main() -> None:
     ap.add_argument("--lang", choices=["en", "hi", "auto"],
                     help="spoken language (default: config 'language', normally en)")
     ap.add_argument("--verbose", action="store_true", help="show yt-dlp debug output")
+    ap.add_argument("--campaign", help="campaign preset from campaigns.json (e.g. skiimasktimmy)")
+    ap.add_argument("--overlay-image", help="PNG to burn on every clip (transparency kept)")
+    ap.add_argument("--section", help="only download/process this part, e.g. 0:30:00-2:00:00")
+    ap.add_argument("--find-facecam", metavar="URL", help="save facecam_check.png (frame ~10 min in + pixel grid)")
+    ap.add_argument("--facecam-at", metavar="TIME", help="with --find-facecam: frame time instead of 0:10:00")
     args = ap.parse_args()
 
     check_tools()
     cfg = load_config(args)
+    if args.find_facecam:
+        find_facecam(args.find_facecam, cfg, parse_time(args.facecam_at) if args.facecam_at else 600.0)
+        return
     urls = list(args.urls)
     if args.list:
         urls += [l.strip() for l in Path(args.list).read_text(encoding="utf-8").splitlines()
                  if l.strip() and not l.strip().startswith("#")]
     if not urls and not args.file:
-        u = input("Paste YouTube link: ").strip()
+        u = input("Paste YouTube or Twitch link: ").strip()
         if u:
             urls.append(u)
     jobs = [(args.file, True)] if args.file else [(u, False) for u in urls]
