@@ -1,0 +1,9 @@
+yt-dlp[default]
+yt-dlp-ejs
+bgutil-ytdlp-pot-provider
+faster-whisper>=1.1
+av<16
+numpy
+google-genai
+nvidia-cublas-cu12
+nvidia-cudnn-cu12==9.*

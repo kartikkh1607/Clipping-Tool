@@ -1,0 +1,33 @@
+{
+  "output_root": "E:\\GamingClips",
+  "num_clips": 5,
+  "min_clip_seconds": 30,
+  "max_clip_seconds": 59,
+  "layout": "blur",
+  "zoom": 1.25,
+  "show_title_banner": true,
+  "words_per_caption": 3,
+  "caption_font": "Arial Black",
+  "caption_size": 84,
+  "whisper_model": "large-v3-turbo",
+  "whisper_cpu_model": "small",
+  "whisper_device": "auto",
+  "language": "en",
+  "hindi_caption_font": "Nirmala UI",
+  "hinglish_roman_captions": true,
+  "gemini_api_key": "",
+  "gemini_model": "gemini-3.8-flash",
+  "gemini_fallback_models": [
+    "gemini-3.7-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite"
+  ],
+  "max_download_height": 1080,
+  "cookies_from_browser": "firefox",
+  "pot_provider": false,
+  "pot_provider_dir": "~/bgutil-ytdlp-pot-provider",
+  "pot_provider_port": 4416,
+  "skip_start_seconds": 10,
+  "skip_end_seconds": 20,
+  "keep_source": false
+}
