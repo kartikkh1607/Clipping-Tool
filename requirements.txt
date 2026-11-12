@@ -5,5 +5,6 @@ faster-whisper>=1.1
 av<16
 numpy
 google-genai
+gradio>=6.31,<7
 nvidia-cublas-cu12
 nvidia-cudnn-cu12==9.*

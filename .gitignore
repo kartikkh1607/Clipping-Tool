@@ -4,3 +4,5 @@ config.json
 facecam_check.png
 _facecam_raw.png
 _grid.ass
+config.json.bak
+config.json.tmp

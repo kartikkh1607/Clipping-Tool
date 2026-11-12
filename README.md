@@ -6,9 +6,20 @@ Paste a YouTube or Twitch link and get the 5 best moments as vertical 1080x1920 
 1. Install **Python 3.11** from python.org and tick **"Add python.exe to PATH"**.
 2. Double-click **`setup_windows.bat`**. It installs FFmpeg, Deno (yt-dlp needs it for YouTube) and the Python packages, including the GPU libraries for your RTX 3050.
 3. Close that window when it finishes.
-4. Optional, but recommended: get a free Gemini API key at https://aistudio.google.com/apikey and paste it into `config.json` → `"gemini_api_key"`. With a key, Gemini picks the final moments and writes proper titles and hook banners. Without one, the pipeline still runs on its own scoring with simple titles.
+4. Optional, but recommended: get a free Gemini API key at https://aistudio.google.com/apikey and paste it in the app's **Settings** page (or into `config.json` → `"gemini_api_key"`). With a key, Gemini picks the final moments and writes proper titles and hook banners. Without one, the pipeline still runs on its own scoring with simple titles.
 
 ## Daily use
+Daily use: double-click the **Clipper** shortcut on the desktop.
+
+It opens Clipper in your browser (http://127.0.0.1:7860, only reachable from this PC):
+- **Make Clips**: paste one or more links (one per line) and press **Make clips** or Enter. Twitch links from a campaign channel select that campaign automatically and show the **Section** box (e.g. `0:30:00-2:00:00`, empty = whole VOD). Campaign, language and clips per video are under **Options**. A progress bar per video and the live log show what's happening; finished clips appear as cards with **Copy title**, **Copy caption** and **Open folder** buttons.
+- **History**: every day's clips, newest first.
+- **Settings**: Gemini API key (**Save key**, **Test key**, **Get a free key**), Gemini model, output folder, clip length, default clips per video, layout and cookies browser. Every save keeps the previous settings in `config.json.bak`. Changes apply to the next run without restarting.
+
+Keep the black Clipper window open (it's minimized) while clips are being made. Closing the browser tab doesn't stop a job: open the shortcut again and the page picks up where it was. Links pasted while a job runs wait their turn (one GPU job at a time).
+If the shortcut is missing, double-click `start_app.bat` in this folder.
+
+### Terminal version
 Double-click **`run_clipper.bat`** and paste a link. It then asks:
 - **Campaign** (`skiimasktimmy` or Enter = none)
 - **Language** (`en` or `hi`, Enter = `en`; only asked without a campaign, since a campaign sets it)

@@ -100,8 +100,17 @@ DEVANAGARI = re.compile(r"[ऀ-ॿ]")
 
 
 # ----------------------------------------------------------------------------- utils
+LOG_HOOK = None  # optional callable(str): the web app (app.py) streams progress messages through this
+
+
 def log(msg: str) -> None:
-    print(f"[{dt.datetime.now():%H:%M:%S}] {msg}", flush=True)
+    line = f"[{dt.datetime.now():%H:%M:%S}] {msg}"
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        print(line.encode("ascii", "replace").decode(), flush=True)
+    if LOG_HOOK:
+        LOG_HOOK(line)
 
 
 def slugify(text: str, max_len: int = 40) -> str:
@@ -271,6 +280,8 @@ def download(url: str, work: Path, cfg: dict) -> tuple[Path, dict]:
     }
     if cfg.get("verbose"):
         opts.update({"verbose": True, "quiet": False})
+    if cfg.get("_progress_hook"):  # web app: download progress bar
+        opts["progress_hooks"] = [cfg["_progress_hook"]]
     if is_youtube(url):  # YouTube-only: bot check workarounds
         if cfg.get("pot_provider"):
             ensure_pot_provider(cfg)
@@ -497,7 +508,19 @@ def transcribe(wav: Path, work: Path, cfg: dict) -> dict:
             + " (first run downloads the model)...")
         cmd = [sys.executable, str(Path(__file__).resolve()), "--_transcribe", str(wav),
                str(out_json), device, model, cfg.get("language") or "", str(b)]
-        res = subprocess.run(cmd)
+        # stream the child's transcript lines (progress for the web app); UTF-8 so Hindi can't crash it
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, env=env, text=True, encoding="utf-8", errors="replace")
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            try:
+                print(line, flush=True)
+            except UnicodeEncodeError:
+                print(line.encode("ascii", "replace").decode(), flush=True)
+            if LOG_HOOK:
+                LOG_HOOK(line)
+        proc.wait()
+        res = proc
         if res.returncode == 0 and out_json.exists():
             return json.loads(out_json.read_text(encoding="utf-8"))
         nxt = attempts[n + 1] if n + 1 < len(attempts) else None
