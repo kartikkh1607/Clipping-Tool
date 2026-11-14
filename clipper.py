@@ -19,6 +19,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import bisect
 import datetime as dt
 import json
 import os
@@ -39,8 +40,8 @@ CONFIG_PATH = HERE / "config.json"
 DEFAULTS = {
     "output_root": "",
     "num_clips": 5,
-    "min_clip_seconds": 30,
-    "max_clip_seconds": 59,
+    "min_clip_seconds": 20,
+    "max_clip_seconds": 40,
     "layout": "blur",            # "blur" = full frame on blurred bg, "crop" = center crop
     "zoom": 1.25,                # blur layout: how much to enlarge the gameplay (1.0 = fit width)
     "show_title_banner": True,   # hook text box at the top of the clip
@@ -71,6 +72,10 @@ DEFAULTS = {
     "overlay_width_pct": 85,             # overlay width as % of 1080
     "facecam_box": None,                 # [x, y, w, h] in facecam_ref pixels, for layout "facecam"
     "facecam_ref": [1280, 720],          # source resolution the facecam box was measured on
+    "ai_pool_size": 24,                  # candidates Gemini reviews (was 12)
+    "vision_review": True,               # Gemini WATCHES each candidate (low-res preview) before picking
+    "vision_batch": 6,                   # candidate previews per Gemini video request
+    "vision_preview_height": 360,        # preview resolution sent to Gemini (keeps tokens low)
 }
 CAMPAIGNS_PATH = HERE / "campaigns.json"
 
@@ -554,6 +559,28 @@ def loudness_per_second(wav: Path, n_sec: int) -> np.ndarray:
     return out
 
 
+def spike_per_second(loud: np.ndarray, window: int = 30) -> np.ndarray:
+    """How much louder each second is than the ~30 s before it (0-1).
+    Game audio (gunfire, music) is loud all the time, so absolute loudness can't tell a peak from
+    normal play. A peak is a JUMP: a scream after quiet, a sudden explosion, chat going off."""
+    n = len(loud)
+    if n == 0:
+        return loud
+    c = np.concatenate([[0.0], np.cumsum(loud)])
+    idx = np.arange(n)
+    a = np.maximum(0, idx - window)
+    base = np.where(idx > a, (c[idx] - c[a]) / np.maximum(idx - a, 1), loud)
+    # the video's typical level around here (5-min rolling median): coming back to normal volume
+    # after a quiet stretch is NOT a peak, so the jump must also beat this
+    step = 10
+    typ_pts = [np.median(loud[max(0, i - 150):i + 150]) for i in range(0, n, step)]
+    typical = np.interp(idx, np.arange(0, n, step), typ_pts)
+    # strongest second in a short window, so a 1-2 s burst still counts
+    peak = np.array([loud[i:i + 3].max() for i in range(n)])
+    jump = np.clip((peak - np.maximum(base, typical)) / 0.30, 0, 1)
+    return np.convolve(jump, np.ones(3) / 3, mode="same")
+
+
 def heat_per_second(heatmap: list, n_sec: int) -> np.ndarray | None:
     if not heatmap:
         return None
@@ -588,8 +615,27 @@ def hype_per_second(segments: list, n_sec: int) -> tuple[np.ndarray, np.ndarray]
     return hype, speech
 
 
+_WORD_INDEX: dict = {"id": None, "words": [], "starts": []}
+
+
+def _word_index(segments: list):
+    """Flat, start-sorted word list, rebuilt only when a new transcript comes in (fast lookups on long VODs)."""
+    if _WORD_INDEX["id"] != id(segments) or _WORD_INDEX.get("n") != len(segments):
+        words = sorted((w for seg in segments for w in seg["words"]), key=lambda w: w[0])
+        _WORD_INDEX.update(id=id(segments), n=len(segments), words=words, starts=[w[0] for w in words])
+    return _WORD_INDEX["words"], _WORD_INDEX["starts"]
+
+
 def words_in(segments: list, start: float, end: float) -> list:
-    return [w for seg in segments for w in seg["words"] if w[0] >= start - 0.05 and w[1] <= end + 0.05]
+    words, starts = _word_index(segments)
+    i = bisect.bisect_left(starts, start - 0.05)
+    out = []
+    for w in words[i:]:
+        if w[0] > end + 0.05:
+            break
+        if w[1] <= end + 0.05:
+            out.append(w)
+    return out
 
 
 def text_in(segments: list, start: float, end: float) -> str:
@@ -597,7 +643,7 @@ def text_in(segments: list, start: float, end: float) -> str:
 
 
 # ----------------------------------------------------------------------------- selection
-def find_candidates(duration: float, segments: list, heat, loud, hype, speech, cfg: dict) -> list[dict]:
+def find_candidates(duration: float, segments: list, heat, loud, hype, speech, cfg: dict, spike=None) -> list[dict]:
     n = len(loud)
     lo, hi = float(cfg["min_clip_seconds"]), float(cfg["max_clip_seconds"])
     skip_a = min(cfg["skip_start_seconds"], duration * 0.05)
@@ -623,8 +669,12 @@ def find_candidates(duration: float, segments: list, heat, loud, hype, speech, c
         return best if best is not None else target
 
     has_heat = heat is not None
+    if spike is None:
+        spike = spike_per_second(loud)
+    # loudness now = 40% absolute level + 60% sudden jump over the previous 30 s
     w_heat, w_loud, w_hype, w_speech = (0.45, 0.30, 0.15, 0.10) if has_heat else (0.0, 0.55, 0.30, 0.15)
     cs = lambda a: np.concatenate([[0], np.cumsum(a)])
+    c_spike = cs(spike)
     c_heat = cs(heat) if has_heat else None
     c_loud, c_hype, c_speech = cs(loud), cs(hype), cs(speech)
 
@@ -644,20 +694,24 @@ def find_candidates(duration: float, segments: list, heat, loud, hype, speech, c
             if e - s < lo - 0.5 or e - s > hi + 0.5:
                 continue
             a, b = int(s), int(np.ceil(e))
-            seg_loud = loud[a:b]
-            l_score = 0.5 * seg_loud.mean() + 0.5 * np.percentile(seg_loud, 90) if len(seg_loud) else 0
+            seg_loud, seg_spike = loud[a:b], spike[a:b]
+            abs_l = 0.5 * seg_loud.mean() + 0.5 * np.percentile(seg_loud, 90) if len(seg_loud) else 0
+            # a clip needs ONE real peak, not loud filler: take the window's top spike moments
+            spk = 0.7 * np.percentile(seg_spike, 95) + 0.3 * seg_spike.mean() if len(seg_spike) else 0
+            l_score = 0.4 * abs_l + 0.6 * spk
             h = mean(c_heat, s, e) if has_heat else 0
             hy = mean(c_hype, s, e)
             sp = mean(c_speech, s, e)
             # strong opening: viewers decide in the first seconds
             hook_end = min(e, s + 5)
-            hook = 0.5 * mean(c_loud, s, hook_end) + 0.5 * (mean(c_heat, s, hook_end) if has_heat else mean(c_hype, s, hook_end))
+            hook = (0.25 * mean(c_loud, s, hook_end) + 0.35 * mean(c_spike, s, hook_end)
+                    + 0.40 * (mean(c_heat, s, hook_end) if has_heat else mean(c_hype, s, hook_end)))
             score = w_heat * h + w_loud * l_score + w_hype * hy + w_speech * sp + 0.15 * hook
             txt = text_in(segments, s, e).lower() if segments else ""
             if any(p in txt for p in PROMO_WORDS):
                 score -= 0.35
             cands.append({"start": round(s, 2), "end": round(e, 2), "score": float(score),
-                          "heat": float(h), "loud": float(l_score), "hype": float(hy)})
+                          "heat": float(h), "loud": float(l_score), "hype": float(hy), "spike": float(spk)})
     cands.sort(key=lambda c: c["score"], reverse=True)
     return cands
 
@@ -678,7 +732,7 @@ GEMINI_MIN_INTERVAL = 60 / 14   # free tier allows 15 requests/min: stay just un
 GEMINI_USED: set[str] = set()   # models that answered during this run
 
 
-def gemini_json(client, cfg: dict, prompt: str, temperature: float):
+def gemini_json(client, cfg: dict, prompt, temperature: float, low_media: bool = False):
     """generate_content with JSON output. 429 (quota) -> next model at once; 503/timeout -> wait and retry."""
     from google.genai import types
 
@@ -692,9 +746,11 @@ def gemini_json(client, cfg: dict, prompt: str, temperature: float):
                     time.sleep(wait)
                 _GEMINI_LAST[0] = time.time()
             try:
+                gc = dict(response_mime_type="application/json", temperature=temperature)
+                if low_media:  # video: ~100 tokens/s instead of ~300, plenty to see a play
+                    gc["media_resolution"] = types.MediaResolution.MEDIA_RESOLUTION_LOW
                 resp = client.models.generate_content(
-                    model=model, contents=prompt,
-                    config=types.GenerateContentConfig(response_mime_type="application/json", temperature=temperature),
+                    model=model, contents=prompt, config=types.GenerateContentConfig(**gc),
                 )
                 data = json.loads(resp.text)
                 GEMINI_USED.add(model)
@@ -712,6 +768,116 @@ def gemini_json(client, cfg: dict, prompt: str, temperature: float):
                     continue
                 break
     raise err
+
+
+VISION_PAD = 3.0  # seconds of context before/after each candidate in its preview
+
+
+def make_preview(src: Path, c: dict, out: Path, cfg: dict, duration: float) -> float:
+    """Small, cheap copy of one candidate for Gemini to watch. Returns where the preview starts."""
+    s = max(0.0, c["start"] - VISION_PAD)
+    e = min(duration, c["end"] + VISION_PAD)
+    h = int(cfg.get("vision_preview_height") or 360)
+    run(["ffmpeg", "-y", "-v", "error", "-ss", f"{s:.2f}", "-i", str(src), "-t", f"{e - s:.2f}",
+         "-vf", f"scale=-2:{h},fps=2", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "32",
+         "-c:a", "aac", "-b:a", "48k", "-ac", "1", "-ar", "22050", "-movflags", "+faststart", str(out)])
+    return s
+
+
+def gemini_watch(pool: list[dict], src: Path, segments: list, meta: dict, cfg: dict, work: Path) -> int:
+    """Gemini WATCHES every candidate (picture + sound) and scores it 0-10 as a standalone Short.
+    Adds watched_score / what_happens / peak_at to each candidate. Returns how many were scored.
+    Any failure just leaves candidates unscored - the text-only pick still runs."""
+    key = cfg.get("gemini_api_key")
+    if not key or not cfg.get("vision_review", True) or not pool:
+        return 0
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        return 0
+    client = genai.Client(api_key=key, http_options={"timeout": 180_000})
+    pdir = work / "previews"
+    pdir.mkdir(exist_ok=True)
+    camp = ""
+    if cfg.get("campaign"):
+        camp = "Approved formats (anything else scores 3 or less): " + "; ".join(cfg.get("approved_formats", [])) + "\n"
+    batch = max(1, int(cfg.get("vision_batch") or 6))
+    scored = 0
+    log(f"Gemini is watching {len(pool)} candidate moments...")
+    for b0 in range(0, len(pool), batch):
+        group = list(enumerate(pool))[b0:b0 + batch]
+        uploaded, parts, starts = [], [], {}
+        try:
+            for i, c in group:
+                f = pdir / f"cand_{i:02d}.mp4"
+                starts[i] = make_preview(src, c, f, cfg, meta["duration"])
+                up = client.files.upload(file=str(f), config={"mime_type": "video/mp4"})
+                uploaded.append(up)
+            # uploaded videos must finish processing before they can be used
+            for _ in range(60):
+                states = [client.files.get(name=u.name).state.name for u in uploaded]
+                if all(st == "ACTIVE" for st in states):
+                    break
+                if any(st == "FAILED" for st in states):
+                    raise RuntimeError("a preview failed processing")
+                time.sleep(2)
+            else:
+                raise RuntimeError("previews still processing after 2 min")
+            for (i, c), up in zip(group, uploaded):
+                lead = c["start"] - starts[i]
+                parts.append(types.Part.from_text(text=(
+                    f"CANDIDATE id={i}: the clip itself starts {lead:.0f} s into this preview and lasts "
+                    f"{c['end'] - c['start']:.0f} s. Transcript: "
+                    + text_in(segments, c['start'], c['end'])[:600])))
+                parts.append(types.Part.from_uri(file_uri=up.uri, mime_type="video/mp4"))
+            parts.append(types.Part.from_text(text=f"""You are the toughest editor of a gaming Shorts channel called
+"Only the peak moments". You just watched {len(group)} candidate moments from "{meta['title']}" by {meta['channel']}.
+Judge what you SEE and HEAR, not just the words: kills, clutches, fails, jump scares, rage, big reactions.
+{camp}Score each 0-10 as a standalone YouTube Short:
+ 9-10: a stranger would stop scrolling and rewatch it; clear payoff, no context needed
+ 6-8: good moment, slightly slow or needs a little context
+ 3-5: ordinary gameplay or talking
+ 0-2: menus, loading, idle, sponsor/giveaway talk, nothing happens
+Be strict: most candidates are NOT a 9.
+Return JSON: {{"clips": [{{"id": int, "score": int, "what_happens": str (max 20 words, what a viewer sees),
+"peak_at": float (seconds from the start of the CLIP where the payoff happens, -1 if none),
+"needs_context": bool}}]}}"""))
+            data = gemini_json(client, cfg, parts, 0.2, low_media=True)
+            rows = data["clips"] if isinstance(data, dict) else data
+            ids = {i for i, _ in group}
+            for r in rows:
+                try:
+                    i = int(r["id"])
+                    if i not in ids:
+                        continue
+                    pool[i]["watched_score"] = max(0, min(10, int(round(float(r.get("score", 0))))))
+                    pool[i]["what_happens"] = str(r.get("what_happens", ""))[:160]
+                    pool[i]["peak_at"] = float(r.get("peak_at", -1))
+                    pool[i]["needs_context"] = bool(r.get("needs_context", False))
+                    scored += 1
+                except Exception:
+                    continue
+            log(f"  watched {min(b0 + batch, len(pool))}/{len(pool)}: " + ", ".join(
+                f"#{i}={pool[i].get('watched_score', '?')}" for i, _ in group))
+        except Exception as e:
+            log(f"  watching batch {b0 // batch + 1} failed ({str(e)[:120]}) - those stay text-only")
+        finally:
+            for u in uploaded:
+                try:
+                    client.files.delete(name=u.name)
+                except Exception:
+                    pass
+    shutil.rmtree(pdir, ignore_errors=True)
+    return scored
+
+
+def rerank_by_watch(pool: list[dict]) -> list[dict]:
+    """Blend the watched score into the automatic score, so even the no-Gemini-pick fallback uses it."""
+    for c in pool:
+        if "watched_score" in c:
+            c["score"] = 0.35 * c["score"] + 0.65 * (c["watched_score"] / 10) - (0.1 if c.get("needs_context") else 0)
+    return sorted(pool, key=lambda c: c["score"], reverse=True)
 
 
 def gemini_pick(pool: list[dict], segments: list, meta: dict, cfg: dict) -> list[dict] | None:
@@ -745,6 +911,11 @@ CAMPAIGN RULES ({cfg.get('campaign_name', cfg['campaign'])}) - clips outside the
   the video title or game_hint), e.g. "Bodycam".
 """
         camp_fields = ', "format": str, "game": str'
+    watch_note = ("" if not any("watched_score" in c for c in pool) else
+                  '\n"watched_score" (0-10) and "what_happens" come from an editor who WATCHED each moment. '
+                  'They are the strongest signal: never pick a watched_score below 6 if better ones exist, and '
+                  'prefer the highest. "payoff_at" is when the payoff happens (seconds in the source): the clip '
+                  'must contain it, and for clutch plays start 3-6 s before it so it lands in the first seconds.')
     heat_note = ("" if any(c["heat"] for c in pool) else
                  '\n"most_replayed" is not available for this source (always 0); rely on loudness and the transcript.')
     items = []
@@ -754,13 +925,20 @@ CAMPAIGN RULES ({cfg.get('campaign_name', cfg['campaign'])}) - clips outside the
             "most_replayed": round(c["heat"], 2), "loudness": round(c["loud"], 2),
             "transcript": text_in(segments, max(0, c["start"] - 10), c["end"] + 10)[:1500],
         }
+        if "watched_score" in c:  # Gemini already watched this one
+            item["watched_score"] = c["watched_score"]
+            item["what_happens"] = c.get("what_happens", "")
+            if c.get("peak_at", -1) >= 0:
+                item["payoff_at"] = round(c["start"] + c["peak_at"], 1)
+            if c.get("needs_context"):
+                item["needs_context"] = True
         if chapter_at(meta, c["start"]):  # Twitch only
             item["game_hint"] = chapter_at(meta, c["start"])
         items.append(item)
     prompt = f"""You are an expert short-form video editor for a gaming clips channel.
 Source video: "{meta['title']}" by {meta['channel']}.
 Below are candidate moments (seconds). "most_replayed" (0-1) is YouTube's real replay heatmap;
-"loudness" (0-1) is how loud/hype the audio is. Transcript covers 10 s before and after each candidate.{heat_note}
+"loudness" (0-1) is how loud/hype the audio is. Transcript covers 10 s before and after each candidate.{heat_note}{watch_note}
 {camp_note}
 
 Pick the {k} BEST moments that work as standalone Shorts: a genuine funny, hype, clutch, rage,
@@ -1203,8 +1381,10 @@ def process(source: str, cfg: dict, local: bool, credit: str = "", local_title: 
         extract_wav(src, wav)
         transcript = transcribe(wav, work, cfg)
         loud = loudness_per_second(wav, n_sec)
+        spike = spike_per_second(loud)
     else:
         transcript, loud = {"segments": []}, np.zeros(n_sec)
+        spike = np.zeros(n_sec)
     segments = transcript["segments"]
     if not cfg.get("language"):  # auto: follow what Whisper detected
         cfg["_lang"] = transcript.get("language") or ""
@@ -1212,9 +1392,11 @@ def process(source: str, cfg: dict, local: bool, credit: str = "", local_title: 
     hype, speech = hype_per_second(segments, n_sec)
 
     log("Scoring moments...")
-    cands = find_candidates(duration, segments, heat, loud, hype, speech, cfg)
+    cands = find_candidates(duration, segments, heat, loud, hype, speech, cfg, spike)
     k = int(cfg["num_clips"])
-    pool = pick_non_overlapping(cands, max(12, 2 * k))
+    pool = pick_non_overlapping(cands, max(int(cfg.get("ai_pool_size") or 24), 2 * k))
+    if gemini_watch(pool, src, segments, meta, cfg, work):
+        pool = rerank_by_watch(pool)
     clips = gemini_pick(pool, segments, meta, cfg) if pool else None
     if clips:
         log(f"Gemini chose {len(clips)} clips")

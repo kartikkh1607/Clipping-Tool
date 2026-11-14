@@ -1,8 +1,8 @@
 {
   "output_root": "E:\\GamingClips",
   "num_clips": 5,
-  "min_clip_seconds": 30,
-  "max_clip_seconds": 59,
+  "min_clip_seconds": 20,
+  "max_clip_seconds": 40,
   "layout": "blur",
   "zoom": 1.25,
   "show_title_banner": true,
@@ -28,5 +28,9 @@
   "pot_provider_port": 4416,
   "skip_start_seconds": 10,
   "skip_end_seconds": 20,
-  "keep_source": false
+  "keep_source": false,
+  "ai_pool_size": 24,
+  "vision_review": true,
+  "vision_batch": 6,
+  "vision_preview_height": 360
 }

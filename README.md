@@ -77,11 +77,12 @@ The `skiimasktimmy` preset in `campaigns.json` enforces the campaign rules:
 
 ## How it picks the "best moments"
 1. **YouTube "Most replayed" heatmap.** These are the parts real viewers rewatch, and this is the strongest signal. It's only available on videos with enough views, which famous videos usually have.
-2. **Audio loudness and hype.** Screams, explosions and hype words ("no way", "let's go", "clutch" and so on) raise a moment's score.
+2. **Sudden jumps in sound, not just loudness.** Game audio is loud all the time, so each second is compared with the 30 seconds before it and with the video's normal level. A scream after silence, a sudden explosion or chat going off scores high; steady gunfire doesn't. Hype words ("no way", "let's go", "clutch" and so on) add to it.
 3. **Strong opening.** The first 5 seconds of a clip are weighted extra.
 4. **Skipped:** the intro, the outro, and sponsor or "subscribe" talk.
 5. **Clean cuts:** clips start and end on sentence boundaries and don't overlap each other.
-6. **Gemini** (if you added a key) reviews the top 12 candidates, picks the 5 best, tightens the cuts and writes the text.
+6. **Gemini watches the moments** (if you added a key). The top 24 candidates are cut into small 360p previews and Gemini watches them, picture and sound, in batches of 6, scoring each 0-10 as a standalone Short and noting when the payoff happens. Silent clutches and visual fails get found this way. The previews are deleted from Google right after.
+7. **Gemini picks the final clips** from those scores, starts clutch plays a few seconds before the payoff, and writes the text. If the watching step fails, it falls back to text-only picking, and if Gemini is unavailable, to the automatic scores.
 
 ## Hindi / Hinglish videos
 Use `--lang hi` (or answer `hi` in `run_clipper.bat`). Whisper transcribes in Hindi, captions use the Nirmala UI font, Hindi hype words ("bhai", "arey", "bachao"…) count towards the score, and with a Gemini key the captions, title, banner and description are written in Roman-script Hinglish.
@@ -89,7 +90,11 @@ Use `--lang hi` (or answer `hi` in `run_clipper.bat`). Whisper transcribes in Hi
 ## Settings (`config.json`)
 | key | default | meaning |
 |---|---|---|
-| `min_clip_seconds` / `max_clip_seconds` | 30 / 59 | clip length; match each Whop campaign's rules |
+| `min_clip_seconds` / `max_clip_seconds` | 20 / 40 | clip length; gaming clips do best around 20-35 s; match each campaign's rules |
+| `ai_pool_size` | 24 | how many candidate moments Gemini reviews |
+| `vision_review` | true | Gemini watches each candidate before picking; set false to save quota (text-only picks) |
+| `vision_batch` | 6 | candidate previews per Gemini request (4 requests for 24 candidates) |
+| `vision_preview_height` | 360 | preview resolution sent to Gemini |
 | `layout` | `blur` | `blur` = full gameplay on a blurred background; `crop` = full-screen center crop; `facecam` = facecam on top + gameplay below (needs `facecam_box`) |
 | `overlay_image` / `overlay_width_pct` | "" / 85 | PNG burned on every clip, kept clear of the facecam, gameplay and captions |
 | `twitch_max_height` | 720 | download cap for Twitch |
