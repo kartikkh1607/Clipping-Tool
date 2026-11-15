@@ -1524,7 +1524,7 @@ def loudnorm_filter(src: Path, start: float, dur: float, cfg: dict) -> str:
     measured_i, measured_tp = measure_loudness(src, start, dur)
     if measured_i is None:
         return base  # couldn't measure: single-pass normalisation, as before
-    if not (np.isfinite(measured_i) and np.isfinite(measured_tp)) or measured_i < -70:
+    if not (np.isfinite(measured_i) and np.isfinite(measured_tp)) or measured_i <= -69.5:
         return ""    # silence: nothing to normalise
     gain = min(24.0, target - measured_i)   # never boost a near-silent clip by more than 24 dB
     if measured_tp + gain <= TRUE_PEAK:
@@ -1542,14 +1542,18 @@ def loudnorm_filter(src: Path, start: float, dur: float, cfg: dict) -> str:
 
 
 def measure_loudness(src: Path, start: float, dur: float, af: str = "") -> tuple[float | None, float | None]:
-    """(integrated LUFS, true peak dBTP) of the source audio in [start, start+dur], after filter `af`."""
-    chain = (af + "," if af else "") + f"loudnorm=TP={TRUE_PEAK}:print_format=json"
+    """(integrated LUFS, true peak dBTP) of the source audio in [start, start+dur], after filter `af`.
+    Uses FFmpeg's EBU R128 meter (ebur128), the standard BS.1770 meter the platforms and qa_check use;
+    loudnorm's built-in meter reads up to ~1 LU differently on short clips."""
+    chain = (af + "," if af else "") + "aresample=48000,ebur128=peak=true"
     try:
         res = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-ss", f"{start:.3f}", "-i", str(src),
                               "-t", f"{dur:.3f}", "-vn", "-map", "0:a:0", "-af", chain, "-f", "null", "-"],
                              capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600)
-        st = json.loads(re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", res.stderr).group(0))
-        return float(st["input_i"]), float(st["input_tp"])
+        summary = res.stderr[res.stderr.rindex("Summary:"):]
+        i = re.search(r"I:\s+(-?[\d.]+|-inf) LUFS", summary).group(1)
+        tp = re.search(r"Peak:\s+(-?[\d.]+|-inf) dBFS", summary).group(1)
+        return float(i), float(tp)
     except Exception:
         return None, None
 
@@ -1631,7 +1635,10 @@ def render_clip(src: Path, clip: dict, folder: Path, base: str, cfg: dict, audio
     ov = overlay_geometry(cfg, layout)
     if ov:
         chain += f";[1:v]scale={ov[0]}:{ov[1]}:{SCALE}[ov];[v0][ov]overlay=(W-w)/2:{ov[2]}[v1]"
-    chain += f";[{'v1' if ov else 'v0'}]ass={ass_name}[vout]"
+    # tag the frames themselves as BT.709: FFmpeg 7.1+ takes the encoder's colour info from the frames and
+    # ignores -color_primaries/-color_trc, so without this newer builds write "unknown" colour tags
+    chain += (f";[{'v1' if ov else 'v0'}]ass={ass_name},"
+              f"setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv[vout]")
     head = ["ffmpeg", "-y", "-v", "error", "-ss", f"{start:.3f}", "-i", str(src)]
     if ov:
         head += ["-i", cfg["overlay_image"]]
