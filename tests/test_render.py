@@ -12,7 +12,7 @@ FAST = {"x264_preset": "ultrafast", "encoder": "x264"}
 
 def probe(path):
     out = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
-                          "stream=codec_type,width,height,r_frame_rate,color_primaries,color_transfer,sample_rate:format=duration",
+                          "stream=codec_type,width,height,r_frame_rate,color_primaries,color_transfer,color_space,sample_rate:format=duration",
                           "-of", "json", str(path)], capture_output=True, text=True).stdout
     return json.loads(out)
 
@@ -43,11 +43,11 @@ def test_layouts_keep_60fps_bt709_and_pass_qa(media, tmp_path, layout, extra):
     v = next(s for s in info["streams"] if s["codec_type"] == "video")
     a = next(s for s in info["streams"] if s["codec_type"] == "audio")
     assert (v["width"], v["height"], v["r_frame_rate"]) == (1080, 1920, "60/1")
-    assert v["color_primaries"] == "bt709" and v["color_transfer"] == "bt709"
+    assert (v.get("color_primaries"), v.get("color_transfer"), v.get("color_space")) == ("bt709", "bt709", "bt709")
     assert a["sample_rate"] == "48000"
     assert abs(float(info["format"]["duration"]) - 8.0) < 0.1
     assert clipper.qa_check(out, 8.0, 60.0, True) == ([], [])
-    assert abs(lufs(out) + 14) < 1.0
+    assert abs(lufs(out) + 14) < 0.5, lufs(out)
 
 
 def test_30fps_source_stays_30fps(media, tmp_path):
