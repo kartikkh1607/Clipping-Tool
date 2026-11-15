@@ -36,12 +36,15 @@ CONFIG_PATH = clipper.CONFIG_PATH
 BACKUP_PATH = HERE / "config.json.bak"
 CAMPAIGNS_PATH = clipper.CAMPAIGNS_PATH
 ICON_PATH = HERE / "clipper.ico"
-DEFAULT_OUT = r"E:\GamingClips"
+if os.name == "nt":
+    DEFAULT_OUT = r"E:\GamingClips" if Path("E:\\").exists() else str(Path.home() / "Videos" / "Clipper")
+else:
+    DEFAULT_OUT = str(Path.home() / ("Movies" if sys.platform == "darwin" else "Videos") / "Clipper")
 HOST, PORT = "127.0.0.1", 7860
 
 GEMINI_MODELS = ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-3.8-flash"]  # free-tier order (clipper.DEFAULTS)
 LANGS = [("English", "en"), ("Hindi", "hi"), ("Auto", "auto")]
-LAYOUTS = ["blur", "crop", "facecam"]
+LAYOUTS = ["auto", "blur", "crop", "facecam"]
 DATE_DIR = re.compile(r"^\d{2}-\d{2}-\d{4}$")
 
 
@@ -163,7 +166,7 @@ def detect(links_text: str):
 # ============================================================================ hints
 HINTS = [
     (r"confirm you.?re not a bot|sign in to confirm|cookies? (database|from browser)|database is locked|could not copy .*cookie",
-     "YouTube blocked the download as a bot. Close Firefox and try again."),
+     "YouTube blocked the download as a bot. Close the cookies browser (Settings) and try again."),
     (r"only allows twitch footage|only allows footage from",
      "This link isn't from the campaign's channel. Set Campaign to \"none\" in Options, or use a link from that channel."),
     (r"--section|section (starts|end)",
@@ -247,6 +250,8 @@ def open_in_explorer(path: str) -> None:
             subprocess.Popen(f'explorer /select,"{p}"')
         else:
             os.startfile(str(p))
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", "-R", str(p)] if p.is_file() else ["open", str(p)])
     else:
         subprocess.Popen(["xdg-open", str(p if p.is_dir() else p.parent)])
 
@@ -296,6 +301,11 @@ WARN_RULES = [
     ("No usable facecam box", "No facecam position for this video, so the clips use the full-frame layout."),
     ("Hinglish transliteration failed", "Some Hindi captions stayed in Devanagari (Gemini didn't answer)."),
     ("no transcript", "Speech recognition failed: clips have no captions."),
+    ("High-quality download failed", "The high-quality re-download failed, so clips were made from the first download (lower resolution)."),
+    ("couldn't line up the high-quality", "Some clips couldn't use the high-quality footage and were made from the first download."),
+    ("rendering from the high-quality footage failed", "Some clips couldn't use the high-quality footage and were made from the first download."),
+    ("quality check failed", "A clip failed the quality check and was re-rendered on the CPU. Check its .txt file."),
+    ("quality check:", "The quality check flagged something on a clip (see the log or the clip's .txt file)."),
 ]
 
 
@@ -338,6 +348,10 @@ def update_progress(v: Video, line: str) -> None:
         v.stage = "Asking Gemini (busy, retrying)"
     elif msg.startswith("Gemini chose"):
         v.pct, v.stage = max(v.pct, 70), msg
+    elif msg.startswith("Fetching the"):
+        v.pct, v.stage = max(v.pct, 70), "Getting the chosen moments in high quality"
+    elif msg.startswith("High-quality footage ready"):
+        v.pct, v.stage = max(v.pct, 72), msg
     elif msg.startswith("Rendering"):
         r = re.match(r"Rendering (\d+) clips", msg)
         v.n_clips = int(r.group(1)) if r else 0
@@ -560,7 +574,7 @@ def check_folder(path: str) -> tuple[bool, str]:
         return False, "Output folder can't be empty."
     p = Path(path)
     if not p.is_absolute():
-        return False, "Use a full path like E:\\GamingClips."
+        return False, f"Use a full path like {DEFAULT_OUT}."
     try:
         existed = p.is_dir()
         p.mkdir(parents=True, exist_ok=True)
@@ -775,10 +789,11 @@ def build() -> gr.Blocks:
                         def_clips = gr.Slider(1, 10, value=int(cfg.get("num_clips") or 5), step=1,
                                               label="Default clips per video")
                     with gr.Row():
-                        layout = gr.Radio(LAYOUTS, value=cfg.get("layout") or "blur", label="Layout",
-                                          info="blur = full frame on blurred background · crop = center crop · facecam = cam on top")
-                        cookies = gr.Radio(["firefox", "none"], value=cfg.get("cookies_from_browser") or "none",
-                                           label="Cookies browser", info="YouTube bot check: read cookies from Firefox")
+                        layout = gr.Radio(LAYOUTS, value=cfg.get("layout") or "auto", label="Layout",
+                                          info="auto = follows the speaker on talking-head clips, blur otherwise · blur = full frame on blurred "
+                                               "background · crop = 9:16 crop that follows faces · facecam = cam on top")
+                        cookies = gr.Radio(["firefox", "chrome", "safari", "none"], value=cfg.get("cookies_from_browser") or "none",
+                                           label="Cookies browser", info="YouTube bot check: read cookies from this browser")
                 save_btn = gr.Button("💾 Save settings", variant="primary", size="lg")
                 settings_msg = gr.Markdown()
 
@@ -802,7 +817,7 @@ def build() -> gr.Blocks:
             n = int(c.get("num_clips") or 5)
             return (mask_key(k), key_status(k), c.get("gemini_model") or GEMINI_MODELS[0],
                     c.get("output_root") or DEFAULT_OUT, int(c["min_clip_seconds"]), int(c["max_clip_seconds"]),
-                    n, c.get("layout") or "blur", c.get("cookies_from_browser") or "none", n,
+                    n, c.get("layout") or "auto", c.get("cookies_from_browser") or "none", n,
                     gr.update(choices=["none"] + list(campaigns())))
 
         demo.load(load_settings, outputs=[key, key_msg, model, folder, min_len, max_len, def_clips, layout,

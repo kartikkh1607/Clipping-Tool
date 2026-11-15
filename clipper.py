@@ -3,12 +3,16 @@
 Clipper - paste a YouTube link, get the best moments as vertical, captioned clips.
 
 Pipeline
-  1. Download the video (yt-dlp) + read YouTube's "Most replayed" heatmap
+  1. Download an analysis copy (yt-dlp) + read YouTube's "Most replayed" heatmap
   2. Transcribe with word timestamps (faster-whisper, GPU if available)
   3. Score every possible window: most-replayed heat + loudness/hype + speech
-  4. (Optional) Gemini picks the final clips, tightens the cut, writes titles
-  5. Render 1080x1920 clips with word-highlight captions and a hook banner
-  6. Save to  <output_root>/DD-MM-YYYY/NN_<channel>_<video>/
+  4. (Optional) Gemini watches the best candidates, picks the final clips and writes titles
+  5. Snap every cut to word boundaries, keeping the payoff inside the clip
+  6. Re-download only the chosen moments at the best quality available (SDR, up to 4K / 60 fps)
+  7. Render 1080x1920 clips at the source frame rate: speaker-tracked crop, blurred-background or
+     facecam layout, word-highlight captions, hook banner, two-pass loudness normalisation
+  8. Check every clip (length, frame rate, audio, black frames, loudness) before calling it done
+  9. Save to  <output_root>/DD-MM-YYYY/NN_<channel>_<video>/
 
 Usage
   python clipper.py "https://www.youtube.com/watch?v=..."
@@ -35,31 +39,58 @@ from pathlib import Path
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:   # framing.py sits next to this file, whatever folder we're started from
+    sys.path.insert(0, str(HERE))
+import framing  # noqa: E402
 CONFIG_PATH = HERE / "config.json"
+
+IS_WINDOWS = os.name == "nt"
+IS_MAC = sys.platform == "darwin"
+# Caption fonts that exist out of the box on each system (libass falls back to a default font otherwise)
+if IS_WINDOWS:
+    _FONT, _HINDI_FONT = "Arial Black", "Nirmala UI"
+elif IS_MAC:
+    _FONT, _HINDI_FONT = "Arial Black", "Kohinoor Devanagari"
+else:
+    _FONT, _HINDI_FONT = "DejaVu Sans", "Noto Sans Devanagari"
 
 DEFAULTS = {
     "output_root": "",
     "num_clips": 5,
     "min_clip_seconds": 20,
     "max_clip_seconds": 40,
-    "layout": "blur",            # "blur" = full frame on blurred bg, "crop" = center crop
+    "layout": "auto",            # "auto" = speaker-tracked crop for talking heads, blur otherwise
+                                 # "blur" = full frame on blurred bg, "crop" = 9:16 crop that follows faces,
+                                 # "facecam" = facecam on top + gameplay below
     "zoom": 1.25,                # blur layout: how much to enlarge the gameplay (1.0 = fit width)
     "show_title_banner": True,   # hook text box at the top of the clip
     "words_per_caption": 3,
-    "caption_font": "Arial Black",
+    "caption_font": _FONT,
     "caption_size": 84,
     "whisper_model": "large-v3-turbo",   # GPU model
-    "whisper_cpu_model": "small",        # used if the GPU fails
+    "whisper_cpu_model": "small",        # used if the GPU fails (and always on a Mac)
     "whisper_device": "auto",            # auto | cuda | cpu
     "whisper_batch_size": 8,             # GPU batched transcription (1 = off); lower it if the GPU runs out of memory
     "render_workers": 2,                 # clips rendered at the same time
     "language": "en",                    # en | hi | "" (auto-detect)
-    "hindi_caption_font": "Nirmala UI",  # supports Devanagari
+    "hindi_caption_font": _HINDI_FONT,   # supports Devanagari
     "hinglish_roman_captions": True,     # hi: transliterate captions to Roman Hinglish via Gemini
     "gemini_api_key": "",                # free key: https://aistudio.google.com/apikey
     "gemini_model": "gemini-3.5-flash-lite",                           # free tier: 500/day, 15/min
     "gemini_fallback_models": ["gemini-3.6-flash", "gemini-3.8-flash"],  # free tier: 20/day, 5/min each
-    "max_download_height": 1080,
+    "max_download_height": 1080,         # analysis copy (whole video); the final clips are re-downloaded in HQ
+    "hq_refetch": True,                  # re-download just the chosen clips at the best quality available
+    "hq_max_height": 2160,               # YouTube: up to 4K for the final clips (downscaled to 1080x1920 = sharp)
+    "twitch_hq_max_height": 1080,        # Twitch: "source" quality is usually 1080p60
+    "max_fps": 60,                       # keep the source frame rate up to this (YouTube Shorts plays 60 fps)
+    "encoder": "auto",                   # auto (NVIDIA GPU if it works, else CPU) | nvenc | x264
+    "nvenc_cq": 19,                      # GPU encoder quality (lower = better, bigger files)
+    "x264_crf": 18,                      # CPU encoder quality (lower = better, bigger files)
+    "x264_preset": "slow",               # CPU encoder effort: slower = better quality per MB
+    "audio_bitrate": "192k",
+    "target_lufs": -14,                  # loudness target (YouTube/TikTok normalise around -14)
+    "qa_check": True,                    # check every rendered clip before calling it done
+    "face_tracking": True,               # crop/auto layouts follow faces; facecam layout finds a moved cam
     "cookies_from_browser": "",          # e.g. "chrome" for age-restricted videos (not used with pot_provider)
     "pot_provider": True,                # start/check the bgutil PO Token server before YouTube downloads
     "pot_provider_dir": "~/bgutil-ytdlp-pot-provider",
@@ -90,16 +121,16 @@ PROMO_WORDS = [
     "link in description", "subscribe", "patreon", "merch", "today's video is brought",
     "check out", "discount", "affiliate", "like and subscribe",
 ]
+# Only words that signal a real moment. Everyday words ("what", "yes", "run", "win", "bro", "kya"...) used
+# to be here too, which made ordinary chatter score as hype. Question marks no longer count either.
 HYPE_WORDS = [
-    "oh my god", "no way", "let's go", "lets go", "what", "bro", "dude", "holy",
-    "insane", "crazy", "wow", "clutch", "wait", "yes", "no no", "oh no", "run",
-    "help", "dead", "kill", "won", "win", "lost", "scream", "huh", "omg", "rage",
-    "impossible", "unbelievable", "hahaha", "haha", "dont", "stop", "please",
+    "oh my god", "no way", "let's go", "lets go", "holy", "insane", "crazy", "wow", "clutch",
+    "no no no", "oh no", "omg", "rage", "impossible", "unbelievable", "hahaha", "what the",
+    "are you kidding", "are you serious", "no shot", "oh my", "bruh", "yooo", "lmao", "screaming",
     # Hindi / Hinglish (Roman + Devanagari, since Whisper writes Hindi in Devanagari)
-    "bhai", "kya", "arey", "arre", "oye", "bas", "chal", "maar", "gaya", "pagal", "bachao",
-    "bhaag", "abe", "yaar", "jaldi", "maaro", "khatam", "mar gaya", "kya baat hai", "oh bhai",
-    "भाई", "क्या", "अरे", "ओए", "बस", "चल", "मार", "गया", "पागल", "बचाओ", "भाग", "अबे", "यार",
-    "जल्दी", "मारो", "खत्म", "मर गया", "क्या बात है",
+    "arey", "arre", "oye", "pagal", "bachao", "bhaag", "maaro", "khatam", "mar gaya", "kya baat hai",
+    "oh bhai", "bhai bhai", "kya scene", "arey yaar",
+    "अरे", "ओए", "पागल", "बचाओ", "भाग", "मारो", "खत्म", "मर गया", "क्या बात है", "भाई भाई",
 ]
 DEVANAGARI = re.compile(r"[ऀ-ॿ]")
 
@@ -262,18 +293,18 @@ def ensure_pot_provider(cfg: dict) -> None:
     raise RuntimeError(f"PO Token provider did not start on port {port}. See {server / 'provider.log'}")
 
 
-def download(url: str, work: Path, cfg: dict) -> tuple[Path, dict]:
-    import yt_dlp
-
-    h = int(cfg["max_download_height"])
-    fmt = f"bv*[height<={h}][ext=mp4]+ba[ext=m4a]/bv*[height<={h}]+ba/b[height<={h}]/b"
+def format_spec(url: str, height: int) -> tuple[str, list[str]]:
+    """yt-dlp format string + sort for the best SDR video up to `height` (HDR would look washed out
+    after the 8-bit conversion, and YouTube always offers an SDR version too)."""
+    sort = ["hdr:sdr", f"res:{height}", "fps"]
     if is_twitch(url):  # Twitch HLS formats already contain audio
-        h = min(h, int(cfg["twitch_max_height"]))
-        fmt = f"b[height<={h}]/b"
+        return f"b[height<={height}]/b", sort
+    return f"bv*[height<={height}]+ba/b[height<={height}]/b", sort
+
+
+def ydl_base_opts(url: str, cfg: dict) -> dict:
+    """yt-dlp options shared by the analysis download and the HQ re-download."""
     opts = {
-        "format": fmt,
-        "merge_output_format": "mp4",
-        "outtmpl": str(work / "source.%(ext)s"),
         "quiet": True,
         "no_warnings": False,
         "noplaylist": True,
@@ -285,8 +316,6 @@ def download(url: str, work: Path, cfg: dict) -> tuple[Path, dict]:
     }
     if cfg.get("verbose"):
         opts.update({"verbose": True, "quiet": False})
-    if cfg.get("_progress_hook"):  # web app: download progress bar
-        opts["progress_hooks"] = [cfg["_progress_hook"]]
     if is_youtube(url):  # YouTube-only: bot check workarounds
         if cfg.get("pot_provider"):
             ensure_pot_provider(cfg)
@@ -295,6 +324,38 @@ def download(url: str, work: Path, cfg: dict) -> tuple[Path, dict]:
                 log("Note: cookies_from_browser is ignored while pot_provider is on")
         elif cfg.get("cookies_from_browser"):
             opts["cookiesfrombrowser"] = (cfg["cookies_from_browser"],)
+    return opts
+
+
+def best_available(info: dict) -> tuple[int, float]:
+    """Highest SDR video height and frame rate this source offers."""
+    hs, fps = [0], [0.0]
+    for f in info.get("formats") or []:
+        if f.get("vcodec") in (None, "none") or not f.get("height"):
+            continue
+        if str(f.get("dynamic_range") or "SDR").upper() != "SDR":
+            continue
+        hs.append(int(f["height"]))
+        fps.append(float(f.get("fps") or 0))
+    return max(hs), max(fps)
+
+
+def download(url: str, work: Path, cfg: dict) -> tuple[Path, dict]:
+    import yt_dlp
+
+    h = int(cfg["max_download_height"])
+    if is_twitch(url):
+        h = min(h, int(cfg["twitch_max_height"]))
+    fmt, sort = format_spec(url, h)
+    opts = {
+        **ydl_base_opts(url, cfg),
+        "format": fmt,
+        "format_sort": sort,
+        "merge_output_format": "mp4",
+        "outtmpl": str(work / "source.%(ext)s"),
+    }
+    if cfg.get("_progress_hook"):  # web app: download progress bar
+        opts["progress_hooks"] = [cfg["_progress_hook"]]
     section = cfg.get("section")
     pre = {}
     if cfg.get("campaign") or section:  # metadata first: check the source and the VOD length before downloading
@@ -342,6 +403,9 @@ def download(url: str, work: Path, cfg: dict) -> tuple[Path, dict]:
         "offset": section[0] if section else 0.0,  # clip times + offset = time in the original video
         "chapters": info.get("chapters") or [],
         "twitch": is_twitch(url),
+        "source_url": url,
+        "best_height": best_available(info)[0],
+        "best_fps": best_available(info)[1],
     }
     if section:  # the file is only the section; its own length is what we process
         meta["duration"] = probe_duration(path)
@@ -383,6 +447,137 @@ def has_audio(path: Path) -> bool:
     return bool(res.stdout.strip())
 
 
+def probe_fps(path: Path) -> float:
+    """Frame rate of the first video stream (30 if it can't be read)."""
+    res = run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+               "stream=avg_frame_rate,r_frame_rate", "-of", "default=nw=1", str(path)])
+    vals = dict(line.split("=", 1) for line in res.stdout.splitlines() if "=" in line)
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        try:
+            num, den = vals.get(key, "0/0").split("/")
+            fps = float(num) / float(den)
+            if 1 <= fps <= 240:
+                return fps
+        except (ValueError, ZeroDivisionError):
+            continue
+    return 30.0
+
+
+def output_fps(src_fps: float, max_fps: float = 60) -> tuple[str, float]:
+    """Frame rate to render at: the source's own rate (NTSC rates kept exact), capped at max_fps."""
+    if src_fps > max_fps + 0.5:
+        src_fps = max_fps
+    for num, den in ((24000, 1001), (30000, 1001), (60000, 1001)):
+        if abs(src_fps - num / den) < 0.02:
+            return f"{num}/{den}", num / den
+    for std in (24, 25, 30, 48, 50, 60):
+        if abs(src_fps - std) < 0.15:
+            return str(std), float(std)
+    return f"{src_fps:.3f}", src_fps
+
+
+# ----------------------------------------------------------------------------- high-quality re-download
+HQ_PAD = 4.0   # seconds of extra footage around each chosen clip (cuts may move a little after alignment)
+
+
+def fetch_hq_segments(clips: list[dict], meta: dict, work: Path, cfg: dict) -> dict[int, Path]:
+    """Download ONLY the chosen moments at the best quality available (one yt-dlp call for all of them).
+    The analysis copy stays the fallback, so a failure here never loses a clip. Returns {clip index: file}."""
+    url = meta.get("source_url")
+    if not url or not cfg.get("hq_refetch", True) or not clips:
+        return {}
+    cap = int(cfg["twitch_hq_max_height"] if meta.get("twitch") else cfg["hq_max_height"])
+    best_h = min(cap, int(meta.get("best_height") or 0))
+    best_fps = float(meta.get("best_fps") or 0)
+    if best_h <= meta.get("_analysis_h", 0) and best_fps <= meta.get("_analysis_fps", 0) + 1:
+        log("The analysis copy is already the best quality available - rendering from it")
+        return {}
+    import yt_dlp
+
+    off = meta.get("offset", 0.0)
+    ranges = [(max(0.0, c["start"] + off - HQ_PAD), c["end"] + off + HQ_PAD) for c in clips]
+    fmt, sort = format_spec(url, cap)
+    hq = work / "hq"
+    hq.mkdir(exist_ok=True)
+    opts = {**ydl_base_opts(url, cfg), "format": fmt, "format_sort": sort, "merge_output_format": "mkv",
+            "outtmpl": str(hq / "seg_%(section_start)d.%(ext)s"),
+            "download_ranges": yt_dlp.utils.download_range_func(None, ranges)}
+    log(f"Fetching the {len(clips)} chosen moments in high quality (best available: {best_h}p"
+        + (f"{best_fps:.0f}" if best_fps else "") + ")...")
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+    except Exception as e:
+        log(f"High-quality download failed ({str(e).strip()[:150]}) - rendering from the analysis copy")
+        return {}
+    out: dict[int, Path] = {}
+    for d in info.get("requested_downloads") or []:
+        p, ss = d.get("filepath"), d.get("section_start")
+        if not p or ss is None or not Path(p).exists():
+            continue
+        for i, (a, _) in enumerate(ranges):
+            if i not in out and abs(a - float(ss)) < 0.5:
+                out[i] = Path(p)
+                break
+    if len(out) < len(clips):
+        log(f"High-quality download returned {len(out)} of {len(clips)} moments - the rest use the analysis copy")
+    return out
+
+
+def read_wav(path: Path, start: float, dur: float) -> tuple[np.ndarray, int]:
+    """Mono 16-bit WAV samples [start, start+dur) as float32."""
+    with wave.open(str(path), "rb") as w:
+        sr = w.getframerate()
+        a = max(0, int(start * sr))
+        if a >= w.getnframes():
+            return np.zeros(0, dtype=np.float32), sr
+        w.setpos(a)
+        data = np.frombuffer(w.readframes(int(dur * sr)), dtype=np.int16).astype(np.float32)
+    return data, sr
+
+
+def best_lag(ref: np.ndarray, probe: np.ndarray) -> tuple[float, int]:
+    """Normalised cross-correlation of probe slid along ref: (best correlation 0-1, lag in samples)."""
+    n, m = len(ref), len(probe)
+    probe = probe - probe.mean()
+    size = 1 << int(np.ceil(np.log2(n + m)))
+    raw = np.fft.irfft(np.fft.rfft(ref, size) * np.conj(np.fft.rfft(probe, size)), size)[: n - m + 1]
+    c1 = np.concatenate([[0.0], np.cumsum(ref, dtype=np.float64)])
+    c2 = np.concatenate([[0.0], np.cumsum(ref.astype(np.float64) ** 2)])
+    win_sum, win_sq = c1[m:] - c1[:-m], c2[m:] - c2[:-m]
+    energy = np.sqrt(np.maximum(win_sq - win_sum ** 2 / m, 1e-9)) * np.linalg.norm(probe)
+    corr = raw / np.maximum(energy, 1e-9)
+    lag = int(np.argmax(corr))
+    return float(corr[lag]), lag
+
+
+def align_segment(seg: Path, wav: Path, nominal: float, work: Path) -> float | None:
+    """Where (in analysis-file seconds) the HQ segment really starts. Partial downloads begin on a keyframe,
+    so the requested start is only approximate; matching the segment's audio against the analysis audio
+    pins it down to the sample. None if the match isn't convincing (e.g. silence)."""
+    seg_wav = work / f"{seg.stem}_align.wav"
+    try:
+        run(["ffmpeg", "-y", "-v", "error", "-i", str(seg), "-t", "40", "-vn", "-ac", "1", "-ar", "16000",
+             "-c:a", "pcm_s16le", str(seg_wav)])
+        s, sr = read_wav(seg_wav, 0, 40)
+    except Exception:
+        return None
+    finally:
+        seg_wav.unlink(missing_ok=True)
+    for a0 in (2.0, 10.0, 18.0):                   # try a few 8 s probes in case one is silent
+        probe = s[int(a0 * sr): int((a0 + 8) * sr)]
+        if len(probe) < 4 * sr or probe.std() < 30:
+            continue
+        lo = max(0.0, nominal + a0 - 12.0)
+        ref, _ = read_wav(wav, lo, 32.0)
+        if len(ref) <= len(probe):
+            continue
+        corr, lag = best_lag(ref, probe)
+        if corr >= 0.6:
+            return lo + lag / sr - a0
+    return None
+
+
 # ----------------------------------------------------------------------------- facecam
 def find_facecam(url: str, cfg: dict, at: float = 600.0) -> Path:
     """Save a frame from ~10 min in with a labelled pixel grid, to read the facecam box from."""
@@ -422,15 +617,26 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return out
 
 
-def facecam_crop(cfg: dict, src_w: int, src_h: int) -> tuple[int, int, int, int] | None:
-    """Facecam box scaled to the source and trimmed (centered) to the 1080x720 slot's aspect.
-    Trimming instead of widening keeps stream overlay borders/widgets around the cam out of the shot."""
+def facecam_box_px(cfg: dict, src_w: int, src_h: int) -> tuple[float, float, float, float] | None:
+    """The configured facecam_box scaled to this source's size (None if not set or set to "auto")."""
     box = cfg.get("facecam_box")
-    if not box:
+    if not box or isinstance(box, str):
         return None
     rw, rh = cfg.get("facecam_ref") or [src_w, src_h]
     sx, sy = src_w / rw, src_h / rh
-    x, y, w, h = box[0] * sx, box[1] * sy, box[2] * sx, box[3] * sy
+    return box[0] * sx, box[1] * sy, box[2] * sx, box[3] * sy
+
+
+def facecam_crop(cfg: dict, src_w: int, src_h: int) -> tuple[int, int, int, int] | None:
+    """Facecam box scaled to the source and trimmed (centered) to the 1080x720 slot's aspect."""
+    box = facecam_box_px(cfg, src_w, src_h)
+    return fit_cam_crop(box, src_w, src_h) if box else None
+
+
+def fit_cam_crop(box, src_w: int, src_h: int) -> tuple[int, int, int, int] | None:
+    """Trim a cam box (source px) to the 1080x720 slot's aspect, centered.
+    Trimming instead of widening keeps stream overlay borders/widgets around the cam out of the shot."""
+    x, y, w, h = box
     target = 1080 / FC_CAM_H
     if w / h > target:
         nw = h * target
@@ -501,6 +707,8 @@ def transcribe(wav: Path, work: Path, cfg: dict) -> dict:
     out_json = work / "transcript.json"
     attempts = []
     dev = cfg["whisper_device"]
+    if dev == "auto" and IS_MAC:  # no CUDA on a Mac: go straight to the CPU model
+        dev = "cpu"
     bs = int(cfg.get("whisper_batch_size") or 1)
     if dev in ("auto", "cuda"):
         attempts.append(("cuda", cfg["whisper_model"], bs))
@@ -541,15 +749,22 @@ def extract_wav(src: Path, wav: Path) -> None:
 
 
 def loudness_per_second(wav: Path, n_sec: int) -> np.ndarray:
+    """0-1 loudness per second. Reads the WAV in 5-minute chunks so a 4-hour VOD needs ~40 MB, not ~2 GB."""
+    rms_parts = []
     with wave.open(str(wav), "rb") as w:
         sr = w.getframerate()
-        data = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32)
-    hop = sr // 2  # 0.5 s
-    n = len(data) // hop
-    if n == 0:
+        hop = sr // 2  # 0.5 s
+        chunk = hop * 600
+        while True:
+            data = np.frombuffer(w.readframes(chunk), dtype=np.int16).astype(np.float32)
+            n = len(data) // hop
+            if n == 0:
+                break
+            frames = data[: n * hop].reshape(n, hop)
+            rms_parts.append(np.sqrt((frames ** 2).mean(axis=1)))
+    if not rms_parts:
         return np.zeros(n_sec)
-    frames = data[: n * hop].reshape(n, hop)
-    rms = np.sqrt((frames ** 2).mean(axis=1)) + 1e-6
+    rms = np.concatenate(rms_parts) + 1e-6
     db = 20 * np.log10(rms)
     lo, hi = np.percentile(db, 10), np.percentile(db, 99)
     norm = np.clip((db - lo) / max(hi - lo, 1e-6), 0, 1)
@@ -602,7 +817,7 @@ def hype_per_second(segments: list, n_sec: int) -> tuple[np.ndarray, np.ndarray]
             w = re.sub(r"[^\wऀ-ॿ' ]", "", word.lower()).strip()
             if not w:
                 continue
-            if w in HYPE_WORDS or "!" in word or "?" in word:
+            if w in HYPE_WORDS or "!" in word:
                 if int(s) < n_sec:
                     hype[int(s)] += 1
         text = " " + seg["text"].lower() + " "
@@ -767,7 +982,7 @@ def gemini_json(client, cfg: dict, prompt, temperature: float, low_media: bool =
                     time.sleep(5 if attempt == 0 else 20)
                     continue
                 break
-    raise err
+    raise err or RuntimeError("no Gemini model configured")
 
 
 VISION_PAD = 3.0  # seconds of context before/after each candidate in its preview
@@ -854,6 +1069,9 @@ Return JSON: {{"clips": [{{"id": int, "score": int, "what_happens": str (max 20 
                     pool[i]["watched_score"] = max(0, min(10, int(round(float(r.get("score", 0))))))
                     pool[i]["what_happens"] = str(r.get("what_happens", ""))[:160]
                     pool[i]["peak_at"] = float(r.get("peak_at", -1))
+                    p = pool[i]
+                    if 0 <= p["peak_at"] <= p["end"] - p["start"] + VISION_PAD:
+                        p["payoff_abs"] = p["start"] + p["peak_at"]  # source time of the payoff
                     pool[i]["needs_context"] = bool(r.get("needs_context", False))
                     scored += 1
                 except Exception:
@@ -980,6 +1198,7 @@ Candidates:
                 log(f"  Gemini pick id {c['id']} dropped: start {s:.0f}s is {abs(s - base['start']):.0f}s from its candidate")
                 continue
             e = min(max(e, s + lo), s + hi, dur)
+            s, e = refine_cut(s, e, segments, lo, hi, dur, base.get("payoff_abs"))
             if e - s < min(lo, dur) - 0.5:
                 log(f"  Gemini pick id {c['id']} dropped: too short ({e - s:.0f}s)")
                 continue
@@ -1000,6 +1219,76 @@ Candidates:
         if len(out) >= k:
             break
     return out or None
+
+
+SENTENCE_END = re.compile(r"[.!?।…]['\")\]]*$")
+
+
+def refine_cut(s: float, e: float, segments: list, lo: float, hi: float, dur: float,
+               payoff: float | None = None) -> tuple[float, float]:
+    """Move a cut so it never splits a word, ends on a finished sentence when one is close, and keeps the
+    payoff (if known) inside the clip; length stays within lo..hi. Clips without speech are left alone,
+    apart from the payoff and length rules."""
+    words, starts = _word_index(segments) if segments else ([], [])
+    ends_seg = {round(seg["end"], 2) for seg in segments} if segments else set()
+
+    def word_at(t):  # the word being spoken at time t, if any
+        i = bisect.bisect_right(starts, t) - 1
+        return words[i] if i >= 0 and words[i][0] < t < words[i][1] else None
+
+    def sentence_final(w):
+        return bool(SENTENCE_END.search(w[2].strip())) or round(w[1], 2) in ends_seg
+
+    # 1. the payoff must be inside, with a beat after it to land
+    if payoff is not None and 0 <= payoff <= dur:
+        if payoff > e - 1.5:
+            e = min(dur, payoff + 2.5)
+            s = max(s, e - hi)
+        if payoff < s + 0.3:
+            s = max(0.0, payoff - 3.0)
+            e = min(e, s + hi)
+    # 2. start: never mid-word (step back to the word's start, leaving a 0.1 s breath)
+    w = word_at(s)
+    if w:
+        i = bisect.bisect_left(starts, w[0])
+        prev_end = words[i - 1][1] if i > 0 else 0.0
+        s = max(prev_end, w[0] - 0.1, 0.0)
+    def after(i):  # cut point just after word i: a short tail, but never into the next word
+        nxt = words[i + 1][0] if i + 1 < len(words) else dur
+        return min(words[i][1] + 0.15, max(words[i][1], nxt - 0.02))
+
+    def last_word_before(t):
+        return bisect.bisect_right(starts, t) - 1
+
+    # 3. end: never mid-word; run on to the end of the sentence when it finishes within 3 s and the cap
+    if words:
+        i = last_word_before(e)
+        if i >= 0 and words[i][1] > e - 0.02:          # cut falls inside (or right at the end of) word i
+            e = after(i)
+        if i >= 0 and not sentence_final(words[i]):
+            j = i + 1
+            while j < len(words) and words[j][0] - e < 3.0 and after(j) <= s + hi:
+                if sentence_final(words[j]):
+                    e = after(j)
+                    break
+                j += 1
+    # 4. too long: end on the last sentence that fits (else the last whole word); too short: run on
+    if e - s > hi:
+        e = s + hi
+        if words:
+            fits = [i for i in range(max(0, last_word_before(s)), last_word_before(e) + 1)
+                    if words[i][0] >= s and after(i) <= s + hi]
+            final = [i for i in fits if sentence_final(words[i]) and after(i) >= s + lo]
+            if final or fits:
+                e = max(s + lo, after((final or fits)[-1]))
+    if e - s < lo:
+        e = s + lo
+        w = word_at(e)
+        if w:
+            i = bisect.bisect_left(starts, w[0])
+            if after(i) - s <= hi:
+                e = after(i)
+    return round(max(0.0, s), 2), round(min(dur, e), 2)
 
 
 def romanize_words(words: list, cfg: dict, batch: int = 120) -> list:
@@ -1147,7 +1436,9 @@ Style: Banner,{font},60,&H00000000,&H000000FF,&H00FFFFFF,&H00FFFFFF,-1,0,0,0,100
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     lines = []
-    banner = (clip.get("banner") or "").strip().upper().replace("{", "").replace("}", "")
+    # strip ASS control characters: a "\N" or "{...}" from Gemini would otherwise become formatting codes
+    banner = re.sub(r"\\[Nnh]", " ", clip.get("banner") or "")
+    banner = re.sub(r"\s+", " ", re.sub(r"[{}\\]", "", banner)).strip().upper()
     if cfg.get("show_title_banner") and banner:
         lines.append(f"Dialogue: 1,{ass_time(0)},{ass_time(dur)},Banner,,0,0,0,,{banner}")
 
@@ -1175,22 +1466,92 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 
 # ----------------------------------------------------------------------------- render
-_ENCODER = None
+_ENCODER: dict = {}
+_ENC_LOCK = threading.Lock()
+SCALE = "flags=lanczos"   # sharpest standard resampler; used for every resize of the picture
 
 
-def pick_encoder() -> list[str]:
-    global _ENCODER
-    if _ENCODER is None:
-        try:
-            run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=320x240:d=0.5",
-                 "-c:v", "h264_nvenc", "-f", "null", "-"])
-            _ENCODER = ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "21", "-b:v", "0",
-                        "-maxrate", "14M", "-bufsize", "20M"]
-            log("Using NVIDIA GPU encoder (h264_nvenc)")
-        except Exception:
-            _ENCODER = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]
-            log("Using CPU encoder (libx264)")
-    return _ENCODER
+def encoder_args(kind: str, cfg: dict, fps: float) -> list[str]:
+    """Video encoder settings. YouTube re-encodes every upload, so the file we hand it should be a clean,
+    high-bitrate master: quality-targeted rate control, adaptive quantisation, a keyframe every 2 s."""
+    gop = str(max(1, int(round(fps * 2))))
+    cq = str(cfg.get("nvenc_cq", 19))
+    if kind == "nvenc":
+        return ["-c:v", "h264_nvenc", "-preset", "p7", "-tune", "hq", "-rc", "vbr", "-cq", cq, "-b:v", "0",
+                "-maxrate", "40M", "-bufsize", "80M", "-spatial-aq", "1", "-temporal-aq", "1",
+                "-rc-lookahead", "32", "-bf", "3", "-profile:v", "high", "-g", gop]
+    if kind == "nvenc_basic":  # older GPUs/drivers that reject lookahead or AQ
+        return ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", cq, "-b:v", "0",
+                "-maxrate", "40M", "-bufsize", "80M", "-profile:v", "high", "-g", gop]
+    return ["-c:v", "libx264", "-preset", str(cfg.get("x264_preset", "slow")), "-crf", str(cfg.get("x264_crf", 18)),
+            "-profile:v", "high", "-x264-params", "aq-mode=3", "-g", gop]
+
+
+def pick_encoder(cfg: dict | None = None) -> str:
+    """'nvenc' (GPU, high-quality settings), 'nvenc_basic' (GPU, plain settings) or 'x264' (CPU).
+    Tested once with a real 1080x1920 encode, so a GPU that can't do it never fails a clip."""
+    cfg = cfg or DEFAULTS
+    want = str(cfg.get("encoder", "auto")).lower()
+    with _ENC_LOCK:
+        if want not in _ENCODER:
+            choice = "x264"
+            if want in ("auto", "nvenc"):
+                for kind in ("nvenc", "nvenc_basic"):
+                    try:
+                        run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=1080x1920:r=60:d=0.5",
+                             *encoder_args(kind, cfg, 60), "-f", "null", "-"])
+                        choice = kind
+                        break
+                    except Exception:
+                        continue
+            _ENCODER[want] = choice
+            log({"nvenc": "Using NVIDIA GPU encoder (h264_nvenc, high-quality settings)",
+                 "nvenc_basic": "Using NVIDIA GPU encoder (h264_nvenc, basic settings)",
+                 "x264": f"Using CPU encoder (libx264, preset {cfg.get('x264_preset', 'slow')}, "
+                         f"CRF {cfg.get('x264_crf', 18)})"}[choice])
+        return _ENCODER[want]
+
+
+TRUE_PEAK = -1.5   # dBTP ceiling (streaming platforms' recommendation)
+
+
+def loudnorm_filter(src: Path, start: float, dur: float, cfg: dict) -> str:
+    """Two-pass loudness: measure this clip's audio (EBU R128), then apply ONE steady gain to reach the
+    target. If that gain would push peaks past the ceiling, a fast peak limiter catches just the peaks.
+    No pumping (single-pass loudnorm rides the volume up and down) and it lands on target. "" for silence."""
+    target = float(cfg.get("target_lufs", -14))
+    base = f"loudnorm=I={target}:TP={TRUE_PEAK}:LRA=11"
+    measured_i, measured_tp = measure_loudness(src, start, dur)
+    if measured_i is None:
+        return base  # couldn't measure: single-pass normalisation, as before
+    if not (np.isfinite(measured_i) and np.isfinite(measured_tp)) or measured_i < -70:
+        return ""    # silence: nothing to normalise
+    gain = min(24.0, target - measured_i)   # never boost a near-silent clip by more than 24 dB
+    if measured_tp + gain <= TRUE_PEAK:
+        return f"volume={gain:.2f}dB"
+    ceiling = 10 ** ((TRUE_PEAK - 0.5) / 20)   # sample-peak limit with headroom for inter-sample peaks
+    limiter = f"alimiter=limit={ceiling:.4f}:attack=3:release=60:level=0"
+    # limiting the peaks takes away some loudness: measure the result and make up for it (the more the
+    # limiter works, the more it takes, so repeat until it lands within 0.3 LU; each pass is ~0.3 s)
+    for _ in range(3):
+        after, _ = measure_loudness(src, start, dur, f"volume={gain:.2f}dB,{limiter}")
+        if after is None or not np.isfinite(after) or abs(target - after) <= 0.3:
+            break
+        gain = min(24.0, gain + max(-3.0, min(4.0, target - after)))
+    return f"volume={gain:.2f}dB,{limiter}"
+
+
+def measure_loudness(src: Path, start: float, dur: float, af: str = "") -> tuple[float | None, float | None]:
+    """(integrated LUFS, true peak dBTP) of the source audio in [start, start+dur], after filter `af`."""
+    chain = (af + "," if af else "") + f"loudnorm=TP={TRUE_PEAK}:print_format=json"
+    try:
+        res = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-ss", f"{start:.3f}", "-i", str(src),
+                              "-t", f"{dur:.3f}", "-vn", "-map", "0:a:0", "-af", chain, "-f", "null", "-"],
+                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600)
+        st = json.loads(re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", res.stderr).group(0))
+        return float(st["input_i"]), float(st["input_tp"])
+    except Exception:
+        return None, None
 
 
 def overlay_geometry(cfg: dict, layout: str) -> tuple[int, int, int] | None:
@@ -1211,69 +1572,143 @@ def overlay_geometry(cfg: dict, layout: str) -> tuple[int, int, int] | None:
     return w, h, y
 
 
-def render_clip(src: Path, clip: dict, folder: Path, base: str, cfg: dict, audio: bool) -> Path:
-    ass_name = f"{base}.ass"
-    out_name = f"{base}.mp4"
-    layout = cfg.get("_layout") or cfg["layout"]
+def video_chain(layout: str, cfg: dict, sw: int, sh: int, fps_str: str) -> str:
+    """filter_complex for the picture, ending in [v0] (1080x1920, bt709, yuv420p, source frame rate)."""
+    even = lambda v: int(v) // 2 * 2
+    head = (f"[0:v]fps={fps_str},scale=in_color_matrix=auto:out_color_matrix=bt709:out_range=tv,"
+            f"format=yuv420p")
     if layout == "facecam":
-        sw, sh = probe_size(src)
-        x, y, w, h = cfg["_facecam"]
+        n = cfg["_cam_crop_n"]                    # trimmed cam crop, 0-1 of the frame
+        cx, cy, cw, ch = even(n[0] * sw), even(n[1] * sh), even(n[2] * sw), even(n[3] * sh)
         game_h = 1920 - FC_GAME_Y
-        gw = min(sw, int(sh * 1080 / game_h) // 2 * 2)
+        gw = min(sw, even(sh * 1080 / game_h))
         gx = (sw - gw) // 2
-        rw = (cfg.get("facecam_ref") or [sw, sh])[0]
-        bx, bw = cfg["facecam_box"][0] * sw / rw, cfg["facecam_box"][2] * sw / rw
-        pad = 16 * sw / rw       # the cam's frame/border around the box
-        if bx + bw / 2 > sw / 2:  # cam on the right: keep it (and its frame) out of the gameplay crop
+        b = cfg["_cam_box_n"]                     # the whole cam (with its frame), to keep it out of the gameplay
+        bx, bw = b[0] * sw, b[2] * sw
+        pad = 16 * sw / 1280
+        if bx + bw / 2 > sw / 2:   # cam on the right: keep it (and its frame) out of the gameplay crop
             gx = max(0, min(gx, int(bx - pad) - gw))
         else:
             gx = min(sw - gw, max(gx, int(bx + bw + pad)))
-        chain = (f"[0:v]split=2[cam][game];"
-                 f"[cam]crop={w}:{h}:{x}:{y},scale=1080:{FC_CAM_H}:flags=lanczos,unsharp=5:5:0.6,"
-                 f"pad=1080:1920:0:0:color={FC_BAND_COLOR}[base];"
-                 f"[game]crop={gw}:{sh}:{gx}:0,scale=1080:{game_h}:force_original_aspect_ratio=increase,"
-                 f"crop=1080:{game_h}[g];"
-                 f"[base][g]overlay=0:{FC_GAME_Y}[v0]")
-    elif layout == "crop":
-        chain = "[0:v]scale=-2:1920,crop=1080:1920[v0]"
-    else:
-        z = float(cfg.get("zoom", 1.0))
-        fw = int(round(1080 * z / 2) * 2)
-        chain = (f"[0:v]split=2[a][b];"
-                 f"[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
-                 f"boxblur=20:2,eq=brightness=-0.10[bg];"
-                 f"[b]scale={fw}:-2,crop=min(iw\\,1080):ih[fg];"
-                 f"[bg][fg]overlay=(W-w)/2:(H-h)/2[v0]")
+        gx = even(gx)
+        return (f"{head},split=2[cam][game];"
+                f"[cam]crop={cw}:{ch}:{cx}:{cy},scale=1080:{FC_CAM_H}:{SCALE},unsharp=5:5:0.5,"
+                f"pad=1080:1920:0:0:color={FC_BAND_COLOR}[base];"
+                f"[game]crop={gw}:{sh}:{gx}:0,scale=1080:{game_h}:force_original_aspect_ratio=increase:{SCALE},"
+                f"crop=1080:{game_h}[g];"
+                f"[base][g]overlay=0:{FC_GAME_Y}[v0]")
+    if layout == "crop":
+        cw = even(sh * 1080 / 1920)
+        if cw >= sw:   # source already 9:16 or narrower: fill the frame
+            return f"{head},scale=1080:1920:force_original_aspect_ratio=increase:{SCALE},crop=1080:1920[v0]"
+        pts = cfg.get("_track")
+        x = framing.crop_x_expr(pts, sw, cw) if pts else str(even((sw - cw) / 2))
+        # crop first, then a single resize: sharper and faster than enlarging the whole frame first
+        return f"{head},crop={cw}:{sh}:{x}:0,scale=1080:1920:{SCALE}[v0]"
+    # blur: the full frame over a blurred, darkened copy of itself (blurred at 1/4 size: same look, 16x less work)
+    z = float(cfg.get("zoom", 1.0))
+    fw = int(round(1080 * z / 2) * 2)
+    fg = (f"scale={fw}:-2:{SCALE},crop=min(iw\\,1080):min(ih\\,1920)" if sw >= sh else
+          f"scale=1080:1920:force_original_aspect_ratio=decrease:{SCALE}")   # vertical/square source: fit it
+    return (f"{head},split=2[a][b];"
+            f"[a]scale=270:480:force_original_aspect_ratio=increase:flags=bilinear,crop=270:480,boxblur=6:2,"
+            f"scale=1080:1920:flags=bicubic,eq=brightness=-0.10[bg];"
+            f"[b]{fg}[fg];"
+            f"[bg][fg]overlay=(W-w)/2:(H-h)/2[v0]")
+
+
+def render_clip(src: Path, clip: dict, folder: Path, base: str, cfg: dict, audio: bool, t0: float = 0.0) -> Path:
+    """Render one clip. clip start/end are analysis-file seconds; `src` begins at t0 in that timeline
+    (0 for the analysis copy, the aligned start for a high-quality segment)."""
+    ass_name = f"{base}.ass"
+    out_name = f"{base}.mp4"
+    layout = cfg.get("_layout") or cfg["layout"]
+    sw, sh = probe_size(src)
+    fps_str, fps = output_fps(probe_fps(src), float(cfg.get("max_fps") or 60))
+    start = max(0.0, clip["start"] - t0)
+    dur = clip["end"] - clip["start"]
+    chain = video_chain(layout, cfg, sw, sh, fps_str)
     ov = overlay_geometry(cfg, layout)
     if ov:
-        chain += f";[1:v]scale={ov[0]}:{ov[1]}[ov];[v0][ov]overlay=(W-w)/2:{ov[2]}[v1]"
+        chain += f";[1:v]scale={ov[0]}:{ov[1]}:{SCALE}[ov];[v0][ov]overlay=(W-w)/2:{ov[2]}[v1]"
     chain += f";[{'v1' if ov else 'v0'}]ass={ass_name}[vout]"
-    dur = clip["end"] - clip["start"]
-    cmd = ["ffmpeg", "-y", "-v", "error", "-ss", f"{clip['start']:.2f}", "-i", str(src)]
+    head = ["ffmpeg", "-y", "-v", "error", "-ss", f"{start:.3f}", "-i", str(src)]
     if ov:
-        cmd += ["-i", cfg["overlay_image"]]
-    cmd += ["-t", f"{dur:.2f}", "-filter_complex", chain, "-map", "[vout]",
-            *pick_encoder(), "-pix_fmt", "yuv420p", "-r", "30"]
-    if audio:  # the stream's own audio only, loudness-normalised; nothing is ever mixed in
-        cmd += ["-map", "0:a:0", "-af", "loudnorm=I=-14:TP=-1.5:LRA=11", "-c:a", "aac", "-b:a", "160k", "-ar", "48000"]
+        head += ["-i", cfg["overlay_image"]]
+    tail = ["-pix_fmt", "yuv420p", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
+            "-color_range", "tv"]
+    if audio:  # the source's own audio only, loudness-normalised, with tiny fades so cuts don't click
+        af = ",".join(f for f in (loudnorm_filter(src, start, dur, cfg), "aresample=48000",
+                                  "afade=t=in:st=0:d=0.03", f"afade=t=out:st={max(0.0, dur - 0.06):.3f}:d=0.06") if f)
+        tail += ["-map", "0:a:0", "-af", af, "-c:a", "aac", "-b:a", str(cfg.get("audio_bitrate", "192k")),
+                 "-ar", "48000", "-ac", "2"]
     else:
-        cmd += ["-an"]
-    cmd += ["-movflags", "+faststart", out_name]
+        tail += ["-an"]
+    tail += ["-movflags", "+faststart", out_name]
+    kind = cfg.get("_force_encoder") or pick_encoder(cfg)
+    cmd = head + ["-t", f"{dur:.3f}", "-filter_complex", chain, "-map", "[vout]", *encoder_args(kind, cfg, fps)] + tail
     try:
         run(cmd, cwd=folder)
     except RuntimeError:
-        if "nvenc" in " ".join(pick_encoder()):
-            global _ENCODER
-            _ENCODER = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]
-            log("GPU encode failed, retrying on CPU")
-            cmd = [c for c in cmd]
-            i = cmd.index("-c:v")
-            j = cmd.index("-pix_fmt")
-            cmd[i:j] = _ENCODER
-            run(cmd, cwd=folder)
-        else:
+        if not kind.startswith("nvenc"):
             raise
+        log("GPU encode failed, retrying on CPU")
+        with _ENC_LOCK:
+            _ENCODER[str(cfg.get("encoder", "auto")).lower()] = "x264"
+        cmd = head + ["-t", f"{dur:.3f}", "-filter_complex", chain, "-map", "[vout]",
+                      *encoder_args("x264", cfg, fps)] + tail
+        run(cmd, cwd=folder)
+    clip["_fps"] = fps
     return folder / out_name
+
+
+def qa_check(path: Path, dur: float, fps: float, audio: bool, target_lufs: float = -14) -> tuple[list, list]:
+    """Check a finished clip. Returns (problems, notes): problems mean the file is broken and worth one
+    re-render; notes are worth a look but the clip is usable."""
+    try:
+        res = run(["ffprobe", "-v", "error", "-show_entries",
+                   "stream=codec_type,width,height,avg_frame_rate:format=duration", "-of", "json", str(path)])
+        info = json.loads(res.stdout)
+    except Exception as e:
+        return [f"unreadable file ({str(e)[:80]})"], []
+    streams = info.get("streams") or []
+    v = next((s for s in streams if s.get("codec_type") == "video"), None)
+    a = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    if not v:
+        return ["no video stream"], []
+    problems, notes = [], []
+    if (v.get("width"), v.get("height")) != (1080, 1920):
+        problems.append(f"size {v.get('width')}x{v.get('height')}")
+    got = float((info.get("format") or {}).get("duration") or 0)
+    if abs(got - dur) > 0.5:
+        problems.append(f"length {got:.1f}s instead of {dur:.1f}s")
+    try:
+        num, den = str(v.get("avg_frame_rate", "0/1")).split("/")
+        vf = float(num) / float(den)
+    except (ValueError, ZeroDivisionError):
+        vf = 0.0
+    if abs(vf - fps) > 1:
+        problems.append(f"{vf:.2f} fps instead of {fps:.2f}")
+    if audio and not a:
+        problems.append("no audio")
+    # one decoding pass for black frames and loudness
+    cmd = ["ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-vf", "blackdetect=d=0.5:pix_th=0.08"]
+    cmd += ["-af", "ebur128"] if a else ["-an"]
+    out = subprocess.run(cmd + ["-f", "null", "-"], capture_output=True, text=True, encoding="utf-8",
+                         errors="replace").stderr
+    black = sum(float(x) for x in re.findall(r"black_duration:\s*([\d.]+)", out))
+    if black > 0.5 * max(dur, 1):
+        problems.append(f"{black:.0f}s of black picture")
+    elif black >= 1.5:
+        notes.append(f"{black:.1f}s of black picture")
+    if a:
+        lufs = re.findall(r"I:\s+(-?[\d.]+|-inf) LUFS", out)
+        level = float(lufs[-1]) if lufs and lufs[-1] != "-inf" else float("-inf")
+        if level < -45:
+            notes.append("the audio is (almost) silent")
+        elif abs(level - target_lufs) > 3:
+            notes.append(f"loudness {level:.1f} LUFS (target {target_lufs:.0f})")
+    return problems, notes
 
 
 def game_tag(game: str) -> str:
@@ -1305,8 +1740,16 @@ Format: {clip.get('format') or 'auto pick (no Gemini)'}   Game: {game or 'unknow
 Banner: {clip.get('banner', '')}
 Loudness score: {clip['loud']:.2f}
 Why: {clip['reason']}
-"""
+{render_info(clip)}"""
     path.write_text(body, encoding="utf-8")
+
+
+def render_info(clip: dict) -> str:
+    """Lines for the .txt info block: what the clip was rendered from and what the quality check found."""
+    out = f"Rendered: {clip.get('_rendered', '?')}\n"
+    qa = clip.get("_qa") or []
+    out += ("Quality check: " + "; ".join(qa) if qa else "Quality check: passed") + "\n"
+    return out
 
 
 def write_details(clip: dict, rank: int, meta: dict, path: Path) -> None:
@@ -1332,7 +1775,7 @@ Rank: {rank} (1 = strongest)
 Source time: {fmt_ts(clip['start'] + meta.get('offset', 0))} - {fmt_ts(clip['end'] + meta.get('offset', 0))}  ({clip['end'] - clip['start']:.0f}s)
 Most-replayed score: {clip['heat']:.2f}   Loudness score: {clip['loud']:.2f}
 Why: {clip['reason']}
-"""
+{render_info(clip)}"""
     path.write_text(body, encoding="utf-8")
 
 
@@ -1340,19 +1783,91 @@ Why: {clip['reason']}
 def make_video_folder(cfg: dict, meta: dict) -> Path:
     day = Path(cfg["output_root"]) / dt.date.today().strftime("%d-%m-%Y")
     day.mkdir(parents=True, exist_ok=True)
-    idx = len([p for p in day.iterdir() if p.is_dir() and re.match(r"^\d{2}_", p.name)]) + 1
+    taken = [int(p.name[:2]) for p in day.iterdir() if p.is_dir() and re.match(r"^\d{2}_", p.name)]
+    idx = max(taken, default=0) + 1   # never reuse a number, even after a folder was deleted
     folder = day / f"{idx:02d}_{slugify(meta['channel'], 20)}_{slugify(meta['title'], 40)}"
     folder.mkdir(parents=True, exist_ok=True)
     return folder
+
+
+def overlaps(c: dict, others: list[dict], gap: float = 1.0) -> bool:
+    return any(not (c["end"] + gap <= x["start"] or c["start"] >= x["end"] + gap) for x in others)
+
+
+def plan_framing(rank: int, clip: dict, src: Path, sw: int, sh: int, cfg: dict) -> dict:
+    """Per-clip layout decision, made on the analysis copy. Returns the extra render settings:
+    _layout, and _track (tracked crop) or _cam_box_n/_cam_crop_n (facecam), all in 0-1 coordinates."""
+    layout = cfg["layout"]
+    s, e = clip["start"], clip["end"]
+    use_faces = cfg.get("face_tracking", True) and framing.detector().ok
+    if layout == "facecam":
+        box = facecam_box_px(cfg, sw, sh)
+        found = None
+        if use_faces:
+            times = [s + 1.5, s + (e - s) * 0.25, (s + e) / 2, s + (e - s) * 0.75, e - 1.5]
+            det = framing.detector()
+            frames = framing.frames_at(src, times, sw, sh)
+            seen = [det.detect(img) for _, img in frames]
+            if not (box and framing.face_in_box(seen, box, sw, sh)):
+                loc = framing.locate_facecam(seen)
+                if loc:
+                    cand = framing.cam_box_from_face(*loc, sw, sh)
+                    if framing.region_is_live(frames, cand, sw, sh):   # a webcam moves; a HUD portrait doesn't
+                        found = cand
+        if found:
+            if box:
+                log(f"  clip {rank}: no face in the configured facecam box - found the cam at "
+                    f"x={found[0]}, y={found[1]} ({sw}x{sh}) and used that")
+            box = found
+        elif box:
+            crop = fit_cam_crop(box, sw, sh)
+            mid = (s + e) / 2
+            if not crop or not facecam_visible(src, crop, [s + 2, mid, e - 2]):
+                log(f"  clip {rank}: facecam not found in its box - using the blur layout")
+                box = None
+        crop = fit_cam_crop(box, sw, sh) if box else None
+        if not crop:
+            if not facecam_box_px(cfg, sw, sh) and not cfg.get("_cam_warned"):
+                log("No usable facecam box for this video - using the blur layout (full frame keeps the facecam visible)")
+                cfg["_cam_warned"] = True
+            return {"_layout": "blur"}
+        return {"_layout": "facecam",
+                "_cam_box_n": (box[0] / sw, box[1] / sh, box[2] / sw, box[3] / sh),
+                "_cam_crop_n": (crop[0] / sw, crop[1] / sh, crop[2] / sw, crop[3] / sh)}
+    if layout in ("auto", "crop"):
+        plan = None
+        if use_faces:
+            track = framing.face_track(src, s, e - s, sw, sh)
+            plan = framing.plan_tracked_crop(track, sw, sh, auto=(layout == "auto"))
+            if plan:
+                plan["points"] = framing.snap_cuts_to_shots(src, s, plan["points"], sw, sh)
+        if layout == "auto":
+            if plan:
+                moves = (len(plan["points"]) - 1) // 2
+                log(f"  clip {rank}: talking head - speaker-tracked crop ({moves} camera move{'s' * (moves != 1)})")
+                return {"_layout": "crop", "_track": plan["points"]}
+            return {"_layout": "blur"}
+        return {"_layout": "crop", "_track": plan["points"] if plan else None}
+    return {"_layout": layout}
 
 
 def process(source: str, cfg: dict, local: bool, credit: str = "", local_title: str = "") -> Path:
     t0 = time.time()
     GEMINI_USED.clear()
     tmp_root = Path(cfg["output_root"]) / "_work"
-    work = tmp_root / dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    work = tmp_root / (dt.datetime.now().strftime("%Y%m%d_%H%M%S_") + os.urandom(2).hex())
     work.mkdir(parents=True, exist_ok=True)
+    try:   # the work folder (multi-GB downloads) is removed even when something fails
+        return _process(source, cfg, local, credit, local_title, work, t0)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+        try:
+            tmp_root.rmdir()
+        except OSError:
+            pass
 
+
+def _process(source: str, cfg: dict, local: bool, credit: str, local_title: str, work: Path, t0: float) -> Path:
     if local:
         src = Path(source).resolve()
         if not src.exists():
@@ -1370,6 +1885,8 @@ def process(source: str, cfg: dict, local: bool, credit: str = "", local_title: 
             meta["channel"] = cfg["creator_name"]
         log(f"Got '{meta['title']}' by {meta['channel']} ({fmt_ts(meta['duration'])})"
             + ("  [Most-replayed heatmap found]" if meta["heatmap"] else "  [no heatmap - using audio/speech only]"))
+    sw, sh = probe_size(src)
+    meta["_analysis_h"], meta["_analysis_fps"] = sh, probe_fps(src)
 
     duration = meta["duration"]
     n_sec = int(np.ceil(duration)) + 1
@@ -1388,28 +1905,30 @@ def process(source: str, cfg: dict, local: bool, credit: str = "", local_title: 
     segments = transcript["segments"]
     if not cfg.get("language"):  # auto: follow what Whisper detected
         cfg["_lang"] = transcript.get("language") or ""
-    heat =heat_per_second(meta["heatmap"], n_sec)
+    heat = heat_per_second(meta["heatmap"], n_sec)
     hype, speech = hype_per_second(segments, n_sec)
 
     log("Scoring moments...")
     cands = find_candidates(duration, segments, heat, loud, hype, speech, cfg, spike)
     k = int(cfg["num_clips"])
+    lo, hi = float(cfg["min_clip_seconds"]), float(cfg["max_clip_seconds"])
     pool = pick_non_overlapping(cands, max(int(cfg.get("ai_pool_size") or 24), 2 * k))
     if gemini_watch(pool, src, segments, meta, cfg, work):
         pool = rerank_by_watch(pool)
     clips = gemini_pick(pool, segments, meta, cfg) if pool else None
     if clips:
         log(f"Gemini chose {len(clips)} clips")
-        if len(clips) < k:  # top up with automatic picks
-            for c in pool:
-                if len(clips) >= k:
-                    break
-                if all(c["end"] + 1 <= x["start"] or c["start"] >= x["end"] + 1 for x in clips):
-                    clips.append(dict(c))
     else:
-        clips = [dict(c) for c in pool[:k]]
+        clips = []
         if not cfg.get("gemini_api_key"):
             log("No Gemini key - using automatic picks and simple titles")
+    for c in pool:   # automatic picks (or top-up), with the same clean-cut rules as Gemini's picks
+        if len(clips) >= k:
+            break
+        c = dict(c)
+        c["start"], c["end"] = refine_cut(c["start"], c["end"], segments, lo, hi, duration, c.get("payoff_abs"))
+        if not overlaps(c, clips):
+            clips.append(c)
     roman = cfg.get("_lang") == "hi" and cfg.get("hinglish_roman_captions")
     if roman and not cfg.get("gemini_api_key"):
         log("No Gemini key - Hindi captions stay in Devanagari")
@@ -1422,33 +1941,63 @@ def process(source: str, cfg: dict, local: bool, credit: str = "", local_title: 
     if not clips:
         raise RuntimeError("Video too short to make clips with the current length settings.")
 
+    # high-quality footage for just these clips, aligned to the analysis timeline by their audio
+    hq: dict[int, tuple[Path, float]] = {}
+    if not local and audio:
+        for i, seg in fetch_hq_segments(clips, meta, work, cfg).items():
+            nominal = clips[i]["start"] - HQ_PAD
+            at = align_segment(seg, wav, max(0.0, nominal), work)
+            seg_dur = probe_duration(seg)
+            if at is None or clips[i]["start"] - at < 0 or clips[i]["end"] - at > seg_dur - 0.05:
+                log(f"  clip {i + 1}: couldn't line up the high-quality footage - using the analysis copy")
+                continue
+            hq[i] = (seg, at)
+        if hq:
+            log(f"High-quality footage ready for {len(hq)} of {len(clips)} clips")
+
     folder = make_video_folder(cfg, meta)
     log(f"Rendering {len(clips)} clips -> {folder}")
     summary = [f"{meta['title']}  —  {meta['channel']}", meta["url"], ""]
     off = meta.get("offset", 0)
-    cam = facecam_crop(cfg, *probe_size(src)) if cfg["layout"] == "facecam" else None
-    if cfg["layout"] == "facecam" and not cam:
-        log("No usable facecam box for this video - using the blur layout (full frame keeps the facecam visible)")
-    pick_encoder()
+    pick_encoder(cfg)
 
     def render_one(rank: int, clip: dict) -> str:
-        ccfg = {**cfg, "_layout": cfg["layout"], "_facecam": cam}  # per clip: renders run in parallel
-        if cfg["layout"] == "facecam":
-            mid = (clip["start"] + clip["end"]) / 2
-            if not cam or not facecam_visible(src, cam, [clip["start"] + 2, mid, clip["end"] - 2]):
-                if cam:
-                    log(f"  clip {rank}: facecam not found in its box - using the blur layout")
-                ccfg["_layout"] = "blur"
+        ccfg = {**cfg, **plan_framing(rank, clip, src, sw, sh, cfg)}  # per clip: renders run in parallel
         base = f"{rank:02d}_{slugify(clip['title'], 45)}"
         write_captions(clip, segments, ccfg, folder / f"{base}.ass", folder / f"{base}.srt")
-        render_clip(src, clip, folder, base, ccfg, audio)
+        r_src, r_t0 = hq.get(rank - 1, (src, 0.0))
+        r_audio = has_audio(r_src)
+        try:
+            out = render_clip(r_src, clip, folder, base, ccfg, r_audio, r_t0)
+        except Exception as ex:   # e.g. an FFmpeg build that can't decode the HQ codec: never lose the clip
+            if r_src == src:
+                raise
+            log(f"  clip {rank}: rendering from the high-quality footage failed ({str(ex).strip()[:120]}) "
+                "- using the first download")
+            r_src, r_t0, r_audio = src, 0.0, audio
+            out = render_clip(r_src, clip, folder, base, ccfg, r_audio, r_t0)
+        dur = clip["end"] - clip["start"]
+        problems, notes = (qa_check(out, dur, clip["_fps"], r_audio, float(cfg.get("target_lufs", -14)))
+                           if cfg.get("qa_check", True) else ([], []))
+        if problems:   # broken file: one more try on the CPU encoder from the analysis copy
+            log(f"  clip {rank}: quality check failed ({'; '.join(problems)}) - re-rendering")
+            r_src, r_t0, r_audio = src, 0.0, audio
+            out = render_clip(r_src, clip, folder, base, {**ccfg, "_force_encoder": "x264"}, r_audio, r_t0)
+            problems, notes = qa_check(out, dur, clip["_fps"], r_audio, float(cfg.get("target_lufs", -14)))
+        h = probe_size(r_src)[1]
+        where = "high-quality download" if r_src != src else ("original file" if local else "first download")
+        clip["_rendered"] = f"{ccfg['_layout']} layout, from the {where} ({h}p, {clip['_fps']:.2f} fps)"
+        clip["_qa"] = problems + notes
+        if problems or notes:
+            log(f"  clip {rank}: quality check: {'; '.join(problems + notes)}")
         if cfg.get("campaign"):
             write_campaign_details(clip, rank, meta, ccfg, folder / f"{base}.txt")
         else:
             write_details(clip, rank, meta, folder / f"{base}.txt")
         (folder / f"{base}.ass").unlink(missing_ok=True)
         log(f"  {rank}/{len(clips)} done: {clip['title']}")
-        return f"{rank:02d}. [{fmt_ts(clip['start'] + off)}-{fmt_ts(clip['end'] + off)}] {clip['title']}"
+        flag = "  [CHECK: " + "; ".join(problems) + "]" if problems else ""
+        return f"{rank:02d}. [{fmt_ts(clip['start'] + off)}-{fmt_ts(clip['end'] + off)}] {clip['title']}{flag}"
 
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max(1, int(cfg.get("render_workers") or 1))) as ex:
@@ -1460,11 +2009,6 @@ def process(source: str, cfg: dict, local: bool, credit: str = "", local_title: 
 
     if cfg.get("keep_source") and not local:
         shutil.move(str(src), str(folder / f"_source{src.suffix}"))
-    shutil.rmtree(work, ignore_errors=True)
-    try:
-        tmp_root.rmdir()
-    except OSError:
-        pass
     log("Gemini model used: " + (", ".join(sorted(GEMINI_USED)) if GEMINI_USED else "none (automatic picks)"))
     log(f"Finished in {(time.time() - t0) / 60:.1f} min -> {folder}")
     return folder
