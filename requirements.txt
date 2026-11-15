@@ -1,10 +1,14 @@
+# yt-dlp is left unpinned on purpose: YouTube changes often and only the newest yt-dlp keeps up
+# (the start scripts update it on every launch). Everything else is pinned to a tested major version.
 yt-dlp[default]
 yt-dlp-ejs
-bgutil-ytdlp-pot-provider
-faster-whisper>=1.1
-av<16
-numpy
-google-genai
+bgutil-ytdlp-pot-provider>=2,<3
+faster-whisper>=1.1,<2
+av>=11,<16
+numpy>=1.26,<3
+google-genai>=1.20,<4
 gradio>=6.31,<7
-nvidia-cublas-cu12
-nvidia-cudnn-cu12==9.*
+opencv-python-headless>=4.8,<6     # face tracking (speaker-following crop, facecam finder)
+# NVIDIA GPU libraries for Whisper - Windows/Linux only (Macs have no CUDA)
+nvidia-cublas-cu12; sys_platform != "darwin"
+nvidia-cudnn-cu12>=9,<10; sys_platform != "darwin"
