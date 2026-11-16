@@ -6,14 +6,27 @@
     "source_channel": "skiimasktimmy",
     "overlay_image": "overlays/skiimasktimmy.png",
     "layout": "facecam",
-    "facecam_box": [986, 516, 276, 148],
-    "facecam_ref": [1280, 720],
+    "facecam_box": [
+      12,
+      512,
+      282,
+      154
+    ],
+    "facecam_ref": [
+      1280,
+      720
+    ],
     "language": "en",
     "min_clip_seconds": 20,
     "max_clip_seconds": 45,
     "num_clips": 5,
     "required_text": "twitch.tv/skiimasktimmy",
-    "campaign_hashtags": ["skiimasktimmy", "twitchclips", "fps", "gaming"],
+    "campaign_hashtags": [
+      "skiimasktimmy",
+      "twitchclips",
+      "fps",
+      "gaming"
+    ],
     "approved_formats": [
       "clutch play (open on the payoff)",
       "extraction tension",
