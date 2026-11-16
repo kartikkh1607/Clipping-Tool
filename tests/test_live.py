@@ -120,3 +120,15 @@ def test_window_time_mapping_dedup_window_and_chunk_cleanup(tmp_path):
     sess2.windows[0].status = "done"
     sess2.cleanup()
     assert c.path.exists()
+
+
+def test_stub_chunk_number_is_not_reused(tmp_path):
+    """A <1 s stub left by a drop is deleted, and its number is used up: the next ffmpeg run must not write a
+    real chunk under the same name (it would be skipped as already seen and 5 minutes would be lost)."""
+    import time
+    rec = live.Recorder(tmp_path, on_chunk=lambda c: None, resolve=lambda: {})
+    (tmp_path / "chunk_00000.ts").write_bytes(b"\x47" + b"\x00" * 4000)   # not a playable chunk: probes as 0 s
+    rec._emit("chunk_00000.ts", None, None, time.time())
+    assert not (tmp_path / "chunk_00000.ts").exists() and rec.chunks == []
+    assert rec._next == 1
+    assert "-segment_start_number" in (cmd := rec._cmd({"url": "in.ts"}, 2)) and cmd[cmd.index("-segment_start_number") + 1] == "1"

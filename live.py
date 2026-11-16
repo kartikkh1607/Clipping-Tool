@@ -200,11 +200,13 @@ class Recorder:
                 dur = clipper.probe_duration(p)
             except Exception:
                 dur = 0.0
+        idx = int(re.search(r"(\d+)", name).group(1))
+        self._next = max(self._next, idx + 1)   # never reuse this number: a new chunk with the same name
+                                                # would be skipped as already seen
         if dur < 1.0:   # a stub left by a drop: nothing to clip
             p.unlink(missing_ok=True)
             return
         wall = run_wall + start if start is not None else time.time() - dur
-        idx = int(re.search(r"(\d+)", name).group(1))
         prev_end = self.chunks[-1].rec_end if self.chunks else 0.0
         rec = max(prev_end, wall - (self.t0 or wall))   # never overlap the previous chunk
         ch = Chunk(idx, p, round(rec, 3), round(dur, 3), wall)
