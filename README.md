@@ -1,6 +1,6 @@
 # Clipper
 
-Paste a YouTube or Twitch link and get the 5 best moments as vertical 1080x1920 clips, with captions, a hook banner, and a title, description and hashtags for each.
+Paste a YouTube or Twitch link (or drop your own video files) and get the 5 best moments as vertical clips (1080x1920, or 1440p / 4K), with captions, a hook banner, and a title, description and hashtags for each. Live streams can be clipped while they're still live.
 
 Clips are rendered from the best footage available (the chosen moments are re-downloaded at up to 4K / 60 fps), keep the source frame rate, follow the speaker on talking-head videos, and are checked automatically before they're marked done. Works on Windows (NVIDIA GPU used when present) and macOS.
 
@@ -21,11 +21,14 @@ Start it with `./start_app.sh` (web app) or `./run_clipper.sh` (terminal version
 Daily use: double-click the **Clipper** shortcut on the desktop (Windows) or run `./start_app.sh` (macOS).
 
 It opens Clipper in your browser (http://127.0.0.1:7860, only reachable from this PC):
-- **Make Clips**: paste one or more links (one per line) and press **Make clips** or Enter. Twitch links from a campaign channel select that campaign automatically and show the **Section** box (e.g. `0:30:00-2:00:00`, empty = whole VOD). Campaign, language and clips per video are under **Options**. A progress bar per video and the live log show what's happening; finished clips appear as cards with **Copy title**, **Copy caption** and **Open folder** buttons.
+- **Make Clips**: paste one or more links (one per line) and press **Make clips** or Enter. Or drop video files (several at once) in the box next to the links, or click it to pick them; **Creator name** (the credit line) and **Title** are optional for files (empty title = the file name). Links and files can go in the same job. Twitch links from a campaign channel select that campaign automatically and show the **Section** box (e.g. `0:30:00-2:00:00`, empty = whole VOD). Campaign, language and clips per video are under **Options**. A progress bar per video and the live log show what's happening; finished clips appear as cards with **Copy title**, **Copy caption** and **Open folder** buttons.
+- **Live**: clip a stream while it's live (see [Live mode](#live-mode)).
 - **History**: every day's clips, newest first.
-- **Settings**: Gemini API key (**Save key**, **Test key**, **Get a free key**), Gemini model, output folder, clip length, default clips per video, layout and cookies browser. Every save keeps the previous settings in `config.json.bak`. Changes apply to the next run without restarting.
+- **Settings**: Gemini API key (**Save key**, **Test key**, **Get a free key**), Gemini model, output folder, clip length, default clips per video, layout, cookies browser, Pro edit switches and **Output quality** (resolution, frame rate, file size, with the estimated size of a 30 s clip). Every save keeps the previous settings in `config.json.bak`. Changes apply to the next run without restarting.
 
-Keep the black Clipper window open (it's minimized) while clips are being made. Closing the browser tab doesn't stop a job: open the shortcut again and the page picks up where it was. Links pasted while a job runs wait their turn (one GPU job at a time).
+Keep the black Clipper window open (it's minimized) while clips are being made. Closing the browser tab doesn't stop a job: open the shortcut again and the page picks up where it was. Links and files added while a job runs wait their turn (one GPU job at a time); so do live windows.
+
+Dropped files are uploaded once into Gradio's temporary folder and processed from there (no second copy); that temporary copy is deleted when its job finishes. Your original file is never touched. Campaign source checks don't apply to local files.
 If the shortcut is missing, double-click `start_app.bat` in this folder.
 
 ### Terminal version
@@ -48,7 +51,20 @@ python clipper.py --file game.mp4 --credit "CreatorName"   a local file
 python clipper.py "TWITCH_VOD" --section 0:30:00-2:00:00   only that part of a VOD
 python clipper.py "LINK" --campaign skiimasktimmy           a campaign preset (campaigns.json)
 python clipper.py "LINK" --overlay-image overlays\logo.png  burn a PNG onto every clip
+python clipper.py --live "https://www.twitch.tv/CHANNEL"     clip a live stream (Ctrl+C stops)
+python clipper.py --live "LIVE_LINK" --clips 3 --campaign skiimasktimmy   3 clips per window, campaign rules
 ```
+
+## Live mode
+Clip a stream while it's still live: the **Live** tab in the app, or `python clipper.py --live "<link>"`.
+1. Paste a live Twitch channel link (`https://www.twitch.tv/<channel>`) or a YouTube live link, pick **Clips per window** (default 2), press **Start**.
+2. The stream is recorded as it is (no re-encoding) into numbered 5-minute chunks. If the stream hiccups or its link expires, Clipper reconnects by itself; when the stream ends, recording stops on its own.
+3. Every time a chunk closes, the last **two** chunks (10 minutes) are clipped with the normal pipeline. The windows slide by 5 minutes, so a moment on a chunk boundary is always whole in one of them. A moment already clipped from an earlier window is never clipped again, and moments in the last 30 s of a window wait for the next one, where they're in the middle.
+4. The clips appear as cards as soon as each one is finished, in `<your folder>\<date>\<channel>_LIVE_<time>\`, numbered on across windows (`01_`, `02_`, ...), with one `_summary.txt` and `_transcript.txt` for the whole stream.
+5. Each clip's `.txt` has the **stream time** (time since the stream went live). The source link points to the Twitch VOD at that time once Twitch has created it (YouTube: the live video at that time), otherwise the stream link plus the stream time.
+6. **Stop** ends the recording; what's already recorded is still clipped. The status shows recording time, chunks, windows clipped and waiting, clips made, reconnects and any errors.
+
+Campaign presets still apply (source check before recording starts, facecam layout, overlay), so a SkiiMaskTimmy live works. Live windows queue behind link/file jobs (one GPU job at a time). Only the last 3 recorded chunks are kept on disk (plus any a waiting window still needs); with `"keep_source": true` all chunks are kept in the stream's folder under `_chunks\`. Gemini reviews 12 candidates per window (`live_ai_pool_size`) so a long stream stays within the free daily quota.
 
 ## Twitch
 Twitch VODs (`twitch.tv/videos/<id>`) and clips (`twitch.tv/<channel>/clip/<slug>`) work like YouTube links. VODs are hours long, so the analysis copy is at most 720p (the chosen moments are then re-downloaded at source quality, usually 1080p60), and `--section START-END` downloads and processes only that part (timestamps in the `.txt` files still point to the right moment in the full VOD). Twitch has no "Most replayed" heatmap, so moments are scored on loudness, the transcript and hype words. The YouTube-only parts (PO Token provider, browser cookies) are skipped for Twitch.
@@ -82,6 +98,7 @@ The `skiimasktimmy` preset in `campaigns.json` enforces the campaign rules:
       _summary.txt     <- all clips with their source timestamps
       _transcript.txt
     02_NextCreator_Next_Video\
+    SkiiMaskTimmy_LIVE_2130\   <- live mode: every window's clips, numbered on
 ```
 
 ## How it picks the "best moments"
@@ -107,14 +124,15 @@ These are also switches in the app's **Settings → Pro edit**.
 ## How it keeps quality high
 1. **Two downloads.** The whole video is downloaded once for analysis (up to 1080p; Twitch 720p). After the clips are chosen, only those moments are downloaded again at the best quality the source has (YouTube up to 4K, Twitch "source" 1080p60). Downscaling 4K to 1080x1920 is what makes vertical crops sharp; before, a 1080p frame was enlarged 1.8x (Twitch 720p: 2.7x, facecam: 4.9x). The new footage is lined up with the first download by matching their audio, so cuts are exact to the frame. If the second download fails or can't be lined up, that clip is made from the first download, so nothing is lost.
 2. **SDR only.** HDR versions are skipped: converted to normal video they look washed out.
-3. **Source frame rate.** 60 fps gameplay stays 60 fps (capped by `max_fps`); 30 fps sources stay 30.
-4. **Encoder settings for a clean master.** YouTube re-encodes every upload, so the file it gets should be clean, but past ~20 Mbps the extra size only costs upload time: NVIDIA: preset p7, constant quality 22, adaptive quantisation and lookahead; CPU: x264 `slow`, CRF 20; both capped at 20 Mbps (`max_bitrate`). Lanczos scaling, BT.709 colour tags, a keyframe every 2 s.
-5. **Audio.** Each clip's loudness is measured first, then one steady gain brings it to -14 LUFS (a fast limiter only catches peaks), so the volume doesn't pump. Tiny fades at the cut points stop clicks. AAC 192k, 48 kHz.
-6. **Layouts that follow people** (`layout`):
+3. **Resolution.** 1080p (1080x1920, default), 1440p (1440x2560) or 4K (2160x3840) in **Settings → Output quality** (`output_height` 1920 / 2560 / 3840). This is a real render at that size, not an upscale at the end: every part of every layout (blur background, crops, facecam split, face zooms, the word behind the head, the overlay) is scaled to it. Captions and the hook banner are drawn by libass, which scales them sharply to the frame. 4K only adds real detail when the source is 1440p or higher (Twitch is 1080p), but YouTube encodes 4K uploads with a better codec, so they can still look cleaner after upload. 1440p and 4K take longer to render.
+4. **Frame rate.** **Source** (default): 60 fps gameplay stays 60 fps (capped by `max_fps`), 30 fps sources stay 30. Or always **60** or always **30** (`output_fps`).
+5. **Encoder settings for a clean master.** YouTube re-encodes every upload, so the file it gets should be clean, but past a point the extra size only costs upload time. **File size** in Settings picks the quality: Smaller (NVIDIA CQ 25 / x264 CRF 23 / max 12 Mbps), **Balanced** (22 / 20 / 20 Mbps, default) or Best (19 / 18 / 35 Mbps). The bitrate cap is for 1080p; it's multiplied by 1.7 at 1440p and 3.5 at 4K. NVIDIA: preset p7, adaptive quantisation and lookahead; CPU: x264 `slow`. Lanczos scaling, BT.709 colour tags, a keyframe every 2 s. The encoder is tested once per output size, so a GPU that can't encode 4K falls back to the CPU instead of failing.
+6. **Audio.** Each clip's loudness is measured first, then one steady gain brings it to -14 LUFS (a fast limiter only catches peaks), so the volume doesn't pump. Tiny fades at the cut points stop clicks. AAC 192k, 48 kHz.
+7. **Layouts that follow people** (`layout`):
    - `auto` (default): on talking-head clips (podcasts, interviews, reactions) a 9:16 crop follows the speaker: it holds still while they stay near the middle, pans when they drift, and cuts on the same frame as the video's own camera switches. Everything else gets `blur`.
    - `blur`: the full frame on a blurred background. `crop`: always the 9:16 crop that follows faces (centre crop if there are none). `facecam`: facecam on top, gameplay below.
    - With `facecam`, every clip checks that a face is actually inside the facecam box. If the streamer moved their cam, Clipper finds it (a face that stays in one place) and uses that; set `"facecam_box": "auto"` to always find it. Faces are found with OpenCV's YuNet model (bundled in `models/`).
-7. **Quality check.** Every finished clip is opened again and checked: 1080x1920, right length and frame rate, audio present, not mostly black, loudness on target. A broken file is re-rendered once on the CPU; anything odd is written in the log and the clip's `.txt` (`Quality check:` line), and broken clips are marked in `_summary.txt`.
+8. **Quality check.** Every finished clip is opened again and checked: the chosen size (e.g. 1080x1920), right length and frame rate, audio present, not mostly black, loudness on target. A broken file is re-rendered once on the CPU; anything odd is written in the log and the clip's `.txt` (`Quality check:` line), and broken clips are marked in `_summary.txt`. The `.txt` also says what the clip was rendered at (`Rendered: 1440x2560 at 60.00 fps (source frame rate); ...`).
 
 ## Hindi / Hinglish videos
 Use `--lang hi` (or answer `hi` in `run_clipper.bat`). Whisper transcribes in Hindi, captions use the Nirmala UI font, Hindi hype words ("bhai", "arey", "bachao"…) count towards the score, and with a Gemini key the captions, title, banner and description are written in Roman-script Hinglish.
@@ -135,9 +153,12 @@ Use `--lang hi` (or answer `hi` in `run_clipper.bat`). Whisper transcribes in Hi
 | `hq_refetch` | true | re-download the chosen moments at the best quality before rendering |
 | `hq_max_height` / `twitch_hq_max_height` | 2160 / 1080 | cap for that high-quality download |
 | `max_fps` | 60 | clips keep the source frame rate up to this |
+| `output_height` | 1920 | clip size: 1920 = 1080x1920, 2560 = 1440x2560, 3840 = 2160x3840 (4K) |
+| `output_fps` | `"source"` | `"source"` (the source's rate, up to `max_fps`), `60` or `30` |
+| `file_size` | balanced | the **File size** choice in Settings (`smaller` / `balanced` / `best`); saving it there also sets the three keys below |
 | `encoder` | auto | `auto` (NVIDIA GPU if it works, else CPU), `nvenc` or `x264` |
 | `nvenc_cq` / `x264_crf` / `x264_preset` | 22 / 20 / slow | encoder quality (lower = better and bigger); `x264_preset` `medium` is faster |
-| `max_bitrate` | 20M | video bitrate cap |
+| `max_bitrate` | 20M | video bitrate cap at 1080p (x1.7 at 1440p, x3.5 at 4K) |
 | `audio_bitrate` / `target_lufs` | 192k / -14 | audio quality and loudness target |
 | `qa_check` | true | check every clip after rendering (and re-render broken ones) |
 | `zoom` | 1.25 | how much to enlarge the gameplay in the blur layout |
@@ -158,7 +179,9 @@ Use `--lang hi` (or answer `hi` in `run_clipper.bat`). Whisper transcribes in Hi
 | `pot_provider` | true | start the bgutil PO Token server before YouTube downloads (set false when using `cookies_from_browser`; the two are never combined) |
 | `gemini_model` | gemini-3.5-flash-lite | free tier: 500 requests/day, 15/min |
 | `gemini_fallback_models` | 3.6-flash, 3.8-flash | free tier: 20/day, 5/min each. A 429 (quota used up) jumps straight to the next model; a 503 (overloaded) waits and retries. All Gemini calls are queued at most 14 per minute. The log shows which model answered |
-| `keep_source` | false | keep the full downloaded video |
+| `keep_source` | false | keep the full downloaded video (live mode: keep every recorded chunk) |
+| `live_clips_per_window` | 2 | live mode: clips from each 10-minute window (the app's **Clips per window**, `--clips` in the terminal) |
+| `live_ai_pool_size` | 12 | live mode: candidates Gemini reviews per window (fewer than `ai_pool_size`, so a long stream stays within the free quota) |
 
 ## If something breaks
 - **YouTube download errors:** `run_clipper.bat` updates yt-dlp on every start. If it still fails, run `pip install -U "yt-dlp[default]"` and check that `deno --version` works.
@@ -170,6 +193,6 @@ Use `--lang hi` (or answer `hi` in `run_clipper.bat`). Whisper transcribes in Hi
 - **The speaker-following crop picks the wrong person:** it follows the biggest face (or both, when they fit). Use `"layout": "blur"` for that video.
 
 ## Tests
-`pip install pytest` then `python -m pytest tests` (needs FFmpeg). The tests render real clips from generated footage and check frame rate, size, colour tags, loudness, the quality check, audio alignment, cut snapping and face-tracking decisions. They also run on GitHub for every push (`.github/workflows/tests.yml`).
+`pip install pytest` then `python -m pytest tests` (needs FFmpeg). The tests render real clips from generated footage and check frame rate, size (1080p, 1440p and 4K), colour tags, loudness, the quality check, audio alignment, cut snapping and face-tracking decisions, and run a fake live stream (generated footage recorded into chunks, sliding windows, no duplicate clips). They also run on GitHub for every push (`.github/workflows/tests.yml`).
 
 Only clip creators who allow it (a Whop campaign or explicit clip permission), and keep the credit line in the description.

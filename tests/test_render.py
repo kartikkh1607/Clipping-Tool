@@ -122,6 +122,83 @@ def test_facecam_face_zoom_and_punch_word(media, tmp_path):
     assert split[band].mean() < 40 and zoom[band].mean() > split[band].mean() + 20
 
 
+@pytest.mark.parametrize("height,size", [(2560, (1440, 2560)), (3840, (2160, 3840))])
+@pytest.mark.parametrize("layout,extra", [
+    ("blur", {}),
+    ("facecam", {"_cam_box_n": (0.77, 0.72, 0.21, 0.2), "_cam_crop_n": (0.79, 0.72, 0.17, 0.2), "_face_n": None,
+                 "_react": [(1.0, 2.5)], "_punch_word": "CLUTCH"}),
+])
+def test_real_1440p_and_4k_renders(media, tmp_path, height, size, layout, extra):
+    """1440p / 4K are rendered at that size (every layout piece scaled), keep 60 fps and pass the QA check."""
+    clip = {"start": 5.0, "end": 9.0, "banner": "TEST", "title": "t", "words": [[5.5, 5.9, " no"], [6.0, 6.4, " way!"]]}
+    out, clip = render(media, tmp_path, layout, {"output_height": height, **extra}, src="hq1440.mp4", clip=clip)
+    v = next(s for s in probe(out)["streams"] if s["codec_type"] == "video")
+    assert (v["width"], v["height"], v["r_frame_rate"]) == (*size, "60/1")
+    assert clip["_size"] == size
+    assert clipper.qa_check(out, 4.0, 60.0, True, size=size) == ([], [])
+    assert clipper.qa_check(out, 4.0, 60.0, True)[0] == [f"size {size[0]}x{size[1]}"]   # 1080x1920 expected
+    if layout == "facecam":
+        assert clip["_punch"].startswith("'CLUTCH'")
+
+
+def test_layout_geometry_scales_and_stays_even(tmp_path):
+    from conftest import ffmpeg as ff
+    png = tmp_path / "ov.png"
+    ff("-f", "lavfi", "-i", "color=c=red:s=600x100", "-frames:v", "1", png)
+    for h, (W, H) in ((1920, (1080, 1920)), (2560, (1440, 2560)), (3840, (2160, 3840))):
+        cfg = {**clipper.DEFAULTS, "output_height": h, "overlay_image": str(png)}
+        assert clipper.out_size(cfg) == (W, H)
+        cam, band, game_y = clipper.fc_geometry(cfg)
+        k = h / 1920
+        assert all(v % 2 == 0 for v in (cam, band, game_y)) and abs(cam - 720 * k) <= 1 and game_y == cam + band
+        for layout in ("blur", "crop", "facecam"):
+            w, oh, y = clipper.overlay_geometry(cfg, layout)
+            assert w % 2 == 0 and oh % 2 == 0 and 0 <= y and y + oh <= H and w <= W
+        assert clipper.overlay_geometry(cfg, "facecam")[2] >= cam            # in the band, below the cam
+        chain = clipper.video_chain("facecam", {**cfg, "_cam_crop_n": (0.8, 0.7, 0.17, 0.2),
+                                                "_cam_box_n": (0.77, 0.7, 0.21, 0.2)}, 1920, 1080, "60")
+        assert f"pad={W}:{H}" in chain and f"overlay=0:{game_y}" in chain
+
+
+def test_file_size_presets_and_bitrate_scaling():
+    base = {**clipper.DEFAULTS, **clipper.FILE_SIZES["balanced"]}
+    assert clipper.scaled_bitrate(base) == "20M"
+    assert clipper.scaled_bitrate({**base, "output_height": 2560}) == "34M"
+    assert clipper.scaled_bitrate({**base, "output_height": 3840}) == "70M"
+    assert clipper.scaled_bitrate({**base, **clipper.FILE_SIZES["smaller"], "output_height": 3840}) == "42M"
+    args = clipper.encoder_args("x264", {**base, "output_height": 2560}, 60)
+    assert args[args.index("-maxrate") + 1] == "34M" and args[args.index("-bufsize") + 1] == "68M"
+    small, best = (clipper.estimate_clip_mb({**base, **clipper.FILE_SIZES[k]}) for k in ("smaller", "best"))
+    k4 = clipper.estimate_clip_mb({**base, "output_height": 3840})
+    assert small[0] < clipper.estimate_clip_mb(base)[0] < best[0] < k4[0] and k4[0] < k4[1]
+
+
+def test_output_fps_30_from_a_60fps_source(media, tmp_path):
+    out, clip = render(media, tmp_path, "blur", {"output_fps": 30})
+    v = next(s for s in probe(out)["streams"] if s["codec_type"] == "video")
+    assert v["r_frame_rate"] == "30/1" and clip["_fps"] == 30.0
+    assert clipper.qa_check(out, 8.0, 30.0, True) == ([], [])
+    assert clipper.render_fps({"output_fps": "source", "max_fps": 60}, 59.94) == ("60000/1001", 60000 / 1001)
+    assert clipper.render_fps({"output_fps": 60}, 30.0) == ("60", 60.0)
+
+
+def test_align_segment_corrects_a_late_audio_start(media, tmp_path):
+    """A segment whose audio starts 0.25 s after its video: the result is where the VIDEO starts."""
+    wav = tmp_path / "audio.wav"
+    clipper.extract_wav(media / "analysis720.mp4", wav)
+    seg = tmp_path / "late.mkv"
+    # video cut at 8.0 s; audio taken from 8.25 s on and stamped to start 0.25 s into the file (stream copy
+    # keeps that start time, like a real stream-copied download)
+    v, a = tmp_path / "v.mkv", tmp_path / "a.mka"
+    ffmpeg("-ss", "8.0", "-i", media / "hq1440.mp4", "-t", "12", "-an", "-c:v", "libx264", "-preset", "ultrafast", v)
+    ffmpeg("-ss", "8.25", "-i", media / "hq1440.mp4", "-t", "11.75", "-vn", "-c:a", "flac", a)
+    ffmpeg("-i", v, "-itsoffset", "0.25", "-i", a, "-map", "0:v", "-map", "1:a", "-c", "copy", seg)
+    st = clipper.stream_start_times(seg)
+    assert abs(clipper.av_start_gap(seg) - 0.25) < 0.03, st
+    at = clipper.align_segment(seg, wav, 8.0, tmp_path)
+    assert at is not None and abs(at - 8.0) < 0.01
+
+
 def test_reaction_picking_and_punch_word():
     import numpy as np
     import reactfx
