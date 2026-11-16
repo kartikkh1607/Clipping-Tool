@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -30,6 +31,7 @@ os.environ.setdefault("GRADIO_ANALYTICS_ENABLED", "False")
 import gradio as gr
 
 import clipper
+import live
 
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = clipper.CONFIG_PATH
@@ -52,6 +54,11 @@ PRO_EDIT = {   # Settings checkbox label -> config.json key
     "Censor slurs in captions": "censor_captions",
 }
 DATE_DIR = re.compile(r"^\d{2}-\d{2}-\d{4}$")
+CLIP_FILE = re.compile(r"^\d{2,3}_.+\.mp4$")   # 01_title.mp4 (live streams can pass 99 clips)
+RES_CHOICES = list(clipper.RESOLUTIONS)                      # 1080p, 1440p, 4K
+FPS_CHOICES = [("Source", "source"), ("60", "60"), ("30", "30")]
+SIZE_CHOICES = [("Smaller", "smaller"), ("Balanced", "balanced"), ("Best", "best")]
+VIDEO_TYPES = [".mp4", ".mkv", ".mov", ".webm", ".avi", ".ts", ".m4v", ".flv"]
 
 
 # ============================================================================ config
@@ -217,9 +224,16 @@ def parse_details(text: str) -> dict:
     return {"title": get("TITLE"), "caption": get("CAPTION") or get("DESCRIPTION")}
 
 
+def clip_files(folder: Path) -> list[Path]:
+    """Finished clips in a folder, in number order (a clip's .txt is written last, after its quality check,
+    so an .mp4 without one is still being made)."""
+    files = [p for p in Path(folder).glob("*.mp4") if CLIP_FILE.match(p.name) and p.with_suffix(".txt").exists()]
+    return sorted(files, key=lambda p: (int(p.name.split("_", 1)[0]), p.name))
+
+
 def clips_in(folder: Path) -> list[dict]:
     out = []
-    for mp4 in sorted(Path(folder).glob("[0-9][0-9]_*.mp4")):
+    for mp4 in clip_files(folder):
         txt = mp4.with_suffix(".txt")
         d = parse_details(txt.read_text(encoding="utf-8", errors="replace")) if txt.exists() else {}
         out.append({"video": str(mp4), "title": d.get("title") or mp4.stem[3:].replace("_", " "),
@@ -239,7 +253,7 @@ def date_folders() -> list[tuple[str, str]]:
             except ValueError:
                 continue
             vids = [v for v in p.iterdir() if v.is_dir()]
-            n = sum(len(list(v.glob("[0-9][0-9]_*.mp4"))) for v in vids)
+            n = sum(len(clip_files(v)) for v in vids)
             label = f"{day:%a %d %b %Y}  ·  {len(vids)} video{'s' * (len(vids) != 1)}, {n} clip{'s' * (n != 1)}"
             items.append((day, label, str(p)))
     items.sort(reverse=True)
@@ -264,9 +278,14 @@ def open_in_explorer(path: str) -> None:
 
 # ============================================================================ jobs
 class Video:
-    def __init__(self, url: str):
-        self.url = url
-        self.name = url
+    """One item of a job: a link, a local file, or one window of a live stream."""
+
+    def __init__(self, url: str, kind: str = "link", credit: str = "", title: str = "", window=None, run=None):
+        self.url = url              # link, file path, or the stream link (live)
+        self.kind = kind            # link | file | live
+        self.credit, self.title = credit, title
+        self.window, self.run = window, run     # live: the live.Window and the LiveRun it belongs to
+        self.name = Path(url).name if kind == "file" else url
         self.state = "waiting"      # waiting | running | done | failed
         self.pct = 0.0
         self.stage = "Waiting"
@@ -280,10 +299,11 @@ class Video:
 
 
 class Job:
-    def __init__(self, urls: list[str], opts: dict):
+    def __init__(self, videos: list[Video], opts: dict):
         self.id = uuid.uuid4().hex[:8]
-        self.videos = [Video(u) for u in urls]
+        self.videos = videos
         self.opts = opts
+        self.live = any(v.kind == "live" for v in videos)
         self.log: list[str] = []
         self.state = "queued"       # queued | running | done
         self.version = 0            # bumped on every change, so viewers know when to refresh
@@ -325,6 +345,8 @@ def on_log(line: str) -> None:
         del job.log[:1000]
     if v:
         update_progress(v, line)
+        if v.run:   # a live window: its progress also shows on the Live tab
+            v.run.add(line, echo=False)
     job.touch()
 
 
@@ -338,6 +360,8 @@ def update_progress(v: Video, line: str) -> None:
         return
     if msg.startswith("Downloading"):
         v.pct, v.stage = max(v.pct, 3), "Downloading"
+    elif msg.startswith("Using local file"):
+        v.pct, v.stage = max(v.pct, 25), "Reading the file"
     elif msg.startswith("Got '"):
         g = re.match(r"Got '(.*)' by (.*?) \((\d[\d:]*)\)", msg)
         if g:
@@ -389,33 +413,57 @@ def download_hook(v: Video, d: dict) -> None:
                 CURRENT[0].touch()
 
 
-def run_video(job: Job, v: Video) -> None:
-    o = job.opts
-    twitch = clipper.is_twitch(v.url)
+def job_cfg(o: dict, section: str | None = None) -> dict:
+    """Pipeline settings for one item: config.json is re-read here, so new settings/keys apply at once."""
     args = argparse.Namespace(
-        campaign=o["campaign"] if o["campaign"] != "none" else None,
-        overlay_image=None,
-        section=o["section"] if (twitch and o["section"]) else None,
-        out=output_root(),           # config.json is re-read here, so new settings/keys apply at once
-        clips=int(o["clips"]),
-        lang=o["lang"],
-        verbose=False,
-    )
+        campaign=o["campaign"] if o.get("campaign", "none") != "none" else None,
+        overlay_image=None, section=section or None, out=output_root(), clips=int(o.get("clips") or 5),
+        lang=o.get("lang") or "en", verbose=False)
     clipper.check_tools()
     cfg = clipper.load_config(args)
     serve_folder(cfg["output_root"])
+    return cfg
+
+
+def gradio_upload(path: str) -> bool:
+    """True for a file Gradio stored in its upload cache (its own copy of what was dropped in the browser)."""
+    try:
+        cache = Path(os.environ.get("GRADIO_TEMP_DIR") or Path(tempfile.gettempdir()) / "gradio").resolve()
+        return Path(path).resolve().is_relative_to(cache)
+    except Exception:
+        return False
+
+
+def run_video(job: Job, v: Video) -> None:
+    o = job.opts
+    if v.kind == "live":
+        run_live_window(job, v)
+        return
+    twitch = v.kind == "link" and clipper.is_twitch(v.url)
+    cfg = job_cfg(o, o["section"] if (twitch and o.get("section")) else None)
     cfg["_progress_hook"] = lambda d: download_hook(v, d)
     if hasattr(clipper, "GEMINI_USED"):
         clipper.GEMINI_USED.clear()
     work_root = Path(cfg["output_root"]) / "_work"
     before = set(work_root.iterdir()) if work_root.is_dir() else set()
     try:
-        folder = clipper.process(v.url, cfg, False)
+        if v.kind == "file":   # the path Gradio gave us is used as it is: no second copy of a big file
+            try:
+                v.duration = clipper.probe_duration(Path(v.url))
+            except Exception:
+                v.duration = 0.0
+            v.name = f"{v.title or Path(v.url).stem}  ·  {v.credit or 'local file'}"
+            folder = clipper.process(v.url, cfg, True, credit=v.credit, local_title=v.title or Path(v.url).stem)
+        else:
+            folder = clipper.process(v.url, cfg, False)
     except BaseException:
         if work_root.is_dir():   # remove this run's half-finished download
             for p in set(work_root.iterdir()) - before:
                 shutil.rmtree(p, ignore_errors=True)
         raise
+    finally:
+        if v.kind == "file" and gradio_upload(v.url):   # Gradio's upload copy isn't needed any more
+            Path(v.url).unlink(missing_ok=True)
     v.folder = str(folder)
     v.clips = clips_in(folder)
 
@@ -447,12 +495,216 @@ def worker() -> None:
 threading.Thread(target=worker, name="clipper-worker", daemon=True).start()
 
 
-def submit(urls: list[str], opts: dict) -> Job:
-    job = Job(urls, opts)
+def submit(videos: list[Video], opts: dict) -> Job:
+    job = Job(videos, opts)
     JOBS[job.id] = job
     JOB_ORDER.append(job.id)
     JOB_QUEUE.put(job)
     return job
+
+
+# ============================================================================ live streams
+class LiveRun:
+    """The live stream being clipped (one at a time): its LiveSession, status and log for the Live tab."""
+
+    def __init__(self, url: str, opts: dict):
+        self.url, self.opts = url, opts
+        self.session: live.LiveSession | None = None
+        self.state = "connecting"   # connecting | live | stopping | finished | failed
+        self.error = ""
+        self.hint = ""
+        self.log: list[str] = []
+        self.started = time.time()
+
+    def add(self, msg: str, echo: bool = True) -> None:
+        line = msg if msg.startswith("[") else f"[{dt.datetime.now():%H:%M:%S}] {msg}"
+        if echo:
+            try:
+                print(line, flush=True)
+            except UnicodeEncodeError:
+                print(line.encode("ascii", "replace").decode(), flush=True)
+        self.log.append(scrub(ANSI.sub("", line)))
+        if len(self.log) > 3000:
+            del self.log[:1000]
+
+    @property
+    def active(self) -> bool:
+        return self.state in ("connecting", "live", "stopping")
+
+
+LIVE: list = [None]   # the current (or last) LiveRun
+
+
+def live_link_problem(url: str) -> str:
+    if not url:
+        return "Paste a live Twitch or YouTube link first."
+    if clipper.is_twitch(url):
+        if re.search(r"twitch\.tv/(videos/|[^/]+/clip/)|clips\.twitch", url):
+            return "That's a VOD or clip, not a live channel. Paste it on the Make Clips tab instead."
+        if not re.search(r"twitch\.tv/[A-Za-z0-9_]+/?(\?.*)?$", url):
+            return "A live Twitch link looks like https://www.twitch.tv/<channel>."
+        return ""
+    if clipper.is_youtube(url):
+        return ""
+    return "Live mode works with Twitch channels and YouTube live streams."
+
+
+def submit_live_window(run: LiveRun, win) -> None:
+    sess = run.session
+    chan = (sess.info.get("channel") if sess else "") or "stream"
+    v = Video(run.url, kind="live", window=win, run=run)
+    v.name = f"🔴 {chan} live · window {win.number} ({win.label()} recorded)"
+    submit([v], {**run.opts, "section": ""})
+    run.add(f"Live: window {win.number} queued ({win.label()} recording time)")
+
+
+def run_live_window(job: Job, v: Video) -> None:
+    run, sess = v.run, v.run.session
+    cfg = job_cfg(job.opts)
+    before = {c["video"] for c in clips_in(sess.folder)} if sess.folder.exists() else set()
+    try:
+        sess.process_window(v.window, cfg)
+    finally:
+        if sess.ended and not sess.pending:   # the last window of a finished stream: tidy up
+            sess.finish()
+            if run.state != "failed":
+                run.state = "finished"
+    v.folder = str(sess.folder)
+    v.clips = [c for c in clips_in(sess.folder) if c["video"] not in before]
+    v.stage = f"Done · {len(v.clips)} new clip{'s' * (len(v.clips) != 1)}"
+
+
+def live_boot(run: LiveRun) -> None:
+    """Background: check the stream, then record it; each closed chunk queues a window job."""
+    try:
+        cfg = job_cfg(run.opts)
+        run.add(f"Live: checking {run.url} ...")
+        info = live.stream_info(run.url, cfg)
+        clipper.check_campaign_source(run.url, info.pop("raw"), cfg)
+        if cfg.get("creator_name"):
+            info["channel"] = cfg["creator_name"]
+        sess = live.LiveSession(run.url, cfg, int(run.opts["per_window"]), info=info, log=run.add,
+                                on_window=lambda w: submit_live_window(run, w))
+        run.session = sess
+        serve_folder(str(Path(cfg["output_root"]).resolve()))
+        first = [info]
+
+        def resolve():   # first call: the info we just fetched; reconnects: fresh URL (they expire)
+            if first:
+                return first.pop()
+            fresh = live.stream_info(run.url, cfg)
+            sess.info.update({k: v for k, v in fresh.items() if k != "raw"})
+            return fresh
+
+        run.state = "live"
+        run.add(f"Live: recording '{info['title']}' by {info['channel']} in {live.CHUNK_SECONDS // 60}-minute "
+                f"chunks -> {sess.folder}")
+        rec = sess.start_recording(resolve=resolve)
+        rec.thread.join()
+        if rec.state == "failed" and not sess.chunks:
+            raise RuntimeError(rec.error or "the recording failed")
+        if run.state != "stopping":
+            run.add("Live: the stream has ended - clipping what's left")
+        while sess.pending:   # windows still waiting for the GPU
+            time.sleep(2)
+        if sess.work.exists():
+            sess.finish()
+        run.state = "finished"
+        run.add("Live: finished")
+    except BaseException as e:
+        err = str(e.code if isinstance(e, SystemExit) else e).strip() or type(e).__name__
+        err = scrub(re.sub(r"^ERROR:\s*", "", ANSI.sub("", err)))
+        run.state, run.error, run.hint = "failed", err.splitlines()[0][:300], hint_for(err)
+        run.add(f"Live: FAILED - {err}")
+
+
+def live_start(url: str, campaign: str, lang: str, per_window: int):
+    url = (parse_links(url) or [""])[0]
+    cur = LIVE[0]
+    if cur and cur.active:
+        return live_status_html(cur, "A live stream is already being clipped. Stop it first.")
+    problem = live_link_problem(url)
+    if problem:
+        return f'<div class="cl-err"><b>{html.escape(problem)}</b></div>'
+    run = LiveRun(url, {"campaign": campaign or "none", "lang": lang or "en", "clips": int(per_window or 2),
+                        "per_window": int(per_window or 2)})
+    LIVE[0] = run
+    threading.Thread(target=live_boot, args=(run,), name="clipper-live", daemon=True).start()
+    return live_status_html(run)
+
+
+def live_stop():
+    run = LIVE[0]
+    if not run or not run.active:
+        return live_status_html(run, "Nothing is being recorded.")
+    if run.session:
+        run.state = "stopping"
+        run.add("Live: stopping the recording (the part already recorded is still clipped)...")
+        run.session.stop()
+    else:
+        run.state, run.error = "failed", "Stopped before the recording started."
+    return live_status_html(run)
+
+
+def live_status_html(run: "LiveRun | None", note: str = "") -> str:
+    parts = []
+    if note:
+        parts.append(f'<div class="cl-warn">⚠️ {html.escape(note)}</div>')
+    if not run:
+        return '<div class="cl-status">' + "".join(parts) + "</div>" if parts else ""
+    sess = run.session
+    s = sess.status() if sess else {}
+    label = {"connecting": "⏳ Connecting to the stream…", "live": "🔴 Recording", "stopping": "⏹️ Stopping…",
+             "finished": "✅ Finished", "failed": "❌ Failed"}[run.state]
+    rstate = s.get("state")
+    if run.state == "live" and rstate == "reconnecting":
+        label = "🟠 Reconnecting (the stream dropped)…"
+    elif run.state in ("live", "stopping") and rstate in ("ended", "stopped") and sess and sess.pending:
+        label = "⚙️ Recording over · clipping the last windows"
+    title = (sess.info.get("title") if sess else "") or run.url
+    chan = (sess.info.get("channel") if sess else "") or ""
+    parts.append(f'''<div class="cl-vid cl-{'failed' if run.state == 'failed' else 'done' if run.state == 'finished' else 'running'}">
+  <div class="cl-row"><span class="cl-name">{html.escape(title)}{'  ·  ' + html.escape(chan) if chan else ''}</span>
+  <span class="cl-stage">{label}</span></div>''')
+    if sess:
+        cur = next((w for w in sess.windows if w.status == "running"), None)
+        stats = [("Recorded", clipper.fmt_ts(s["recording"])), ("Chunks", s["chunks"]),
+                 ("Windows clipped", s["windows_done"]), ("Waiting", s["windows_queued"] - (1 if cur else 0)),
+                 ("Clips made", s["clips"])]
+        if s["reconnects"]:
+            stats.append(("Reconnects", s["reconnects"]))
+        if s["windows_failed"]:
+            stats.append(("Windows failed", s["windows_failed"]))
+        parts.append('<div class="cl-stats">' + "".join(
+            f'<div><span>{html.escape(k)}</span><b>{html.escape(str(v))}</b></div>' for k, v in stats) + "</div>")
+        if cur:
+            parts.append(f'<div class="cl-note">⚙️ Clipping window {cur.number} ({cur.label()} recorded)…</div>')
+        ahead = sum(1 for j in JOBS.values() if j.state != "done" and not j.live)
+        if ahead and sess.pending and not cur:
+            parts.append(f'<div class="cl-note">⏳ The next window waits for {ahead} link/file job'
+                         f'{"s" * (ahead != 1)} to finish (one GPU job at a time).</div>')
+        parts.append(f'<div class="cl-note">📂 {html.escape(str(sess.folder))}</div>')
+        for e in s["errors"]:
+            parts.append(f'<div class="cl-warn">⚠️ {html.escape(scrub(e))}</div>')
+    if run.error:
+        parts.append(f'<div class="cl-err"><b>{html.escape(run.hint or "")}</b><br><span>{html.escape(run.error)}</span></div>')
+    parts.append("</div>")
+    return '<div class="cl-status">' + "".join(parts) + "</div>"
+
+
+def live_clips() -> list[dict]:
+    run = LIVE[0]
+    if not run or not run.session or not run.session.folder.exists():
+        return []
+    return clips_in(run.session.folder)
+
+
+def live_tick(shown: list):
+    """Live tab refresh (every 2 s): status, log, and the clip cards only when a new clip is finished."""
+    run = LIVE[0]
+    clips = live_clips()
+    same = [c["video"] for c in clips] == [c["video"] for c in (shown or [])]
+    return live_status_html(run), "\n".join(run.log[-400:]) if run else "", gr.skip() if same else clips
 
 
 # ============================================================================ status view
@@ -502,10 +754,23 @@ def watch(job_id: str):
 SECTION_RE = re.compile(r"\s*([\d:.]+)\s*-\s*([\d:.]+)\s*")
 
 
-def start(links: str, campaign: str, lang: str, clips: int, section: str):
+def file_paths(files) -> list[str]:
+    """Paths from the gr.File box (a list of paths, or of file objects in older Gradio versions)."""
+    out = []
+    for f in files or []:
+        p = f if isinstance(f, str) else getattr(f, "path", None) or getattr(f, "name", None) or (
+            f.get("path") if isinstance(f, dict) else None)
+        if p and Path(p).is_file() and str(p) not in out:
+            out.append(str(p))
+    return out
+
+
+def start(links: str, files, credit: str, title: str, campaign: str, lang: str, clips: int, section: str):
     urls = parse_links(links)
-    if not urls:
-        yield gr.update(), '<div class="cl-err"><b>Paste at least one YouTube or Twitch link first.</b></div>', [], None
+    paths = file_paths(files)
+    if not urls and not paths:
+        yield gr.update(), ('<div class="cl-err"><b>Paste at least one YouTube or Twitch link, or drop a video '
+                            'file, first.</b></div>'), [], None
         return
     section = (section or "").strip()
     if section:
@@ -514,15 +779,22 @@ def start(links: str, campaign: str, lang: str, clips: int, section: str):
             yield gr.update(), ('<div class="cl-err"><b>The section must look like 0:30:00-2:00:00 '
                                 '(start-end, end after start). Leave it empty for the whole VOD.</b></div>'), [], None
             return
-    job = submit(urls, {"campaign": campaign or "none", "lang": lang or "en", "clips": clips or 5, "section": section})
+    credit, title = (credit or "").strip(), (title or "").strip()
+    videos = [Video(u) for u in urls]
+    for i, p in enumerate(paths, 1):   # local files: no download, no campaign source check
+        t = (title + (f" ({i})" if len(paths) > 1 else "")) if title else ""
+        videos.append(Video(p, kind="file", credit=credit, title=t))
+    job = submit(videos, {"campaign": campaign or "none", "lang": lang or "en", "clips": clips or 5, "section": section})
     yield from watch(job.id)
 
 
 def reattach():
-    """On page load: show the running (or last) job, even after the tab was closed."""
-    if not JOB_ORDER:
+    """On page load: show the running (or last) link/file job, even after the tab was closed (live windows
+    show on the Live tab)."""
+    ids = [j for j in JOB_ORDER if not JOBS[j].live]
+    if not ids:
         return
-    yield from watch(JOB_ORDER[-1])
+    yield from watch(ids[-1])
 
 
 # ============================================================================ settings
@@ -592,7 +864,36 @@ def check_folder(path: str) -> tuple[bool, str]:
         return False, f"Can't use that folder: {e}"
 
 
-def save_settings(key_field, model, folder, min_len, max_len, clips, layout, cookies, pro=None):
+def res_label(cfg: dict) -> str:
+    h = clipper.out_height(cfg)
+    return next((k for k, v in clipper.RESOLUTIONS.items() if v == h), "1080p")
+
+
+def size_choice(cfg: dict) -> str:
+    """The File size option matching config.json (older configs only have nvenc_cq: match on that)."""
+    fs = str(cfg.get("file_size") or "").lower()
+    if fs in clipper.FILE_SIZES:
+        return fs
+    cq = cfg.get("nvenc_cq", 22)
+    return next((k for k, v in clipper.FILE_SIZES.items() if v["nvenc_cq"] == cq), "balanced")
+
+
+def quality_cfg(res: str, fps: str, size: str) -> dict:
+    return {**read_config(), "output_height": clipper.RESOLUTIONS.get(res, 1920),
+            "output_fps": fps if fps in ("60", "30") else "source", **clipper.FILE_SIZES.get(size, {})}
+
+
+def estimate_text(res: str, fps: str, size: str) -> str:
+    cfg = quality_cfg(res, fps, size)
+    typ, worst = clipper.estimate_clip_mb(cfg, 30)
+    w, h = clipper.out_size(cfg)
+    rate = "the source frame rate (60 fps for most gameplay)" if cfg["output_fps"] == "source" else f"{cfg['output_fps']} fps"
+    return (f"**Estimated size per 30 s clip: about {typ} MB** (up to {worst} MB for very busy gameplay) · "
+            f"{w}x{h} at {rate}, bitrate cap {clipper.scaled_bitrate(cfg)}bps")
+
+
+def save_settings(key_field, model, folder, min_len, max_len, clips, layout, cookies, pro=None,
+                  res=None, fps=None, size=None):
     errors = []
     ok, folder_msg = check_folder(folder)
     if not ok:
@@ -616,6 +917,12 @@ def save_settings(key_field, model, folder, min_len, max_len, clips, layout, coo
                "cookies_from_browser": "" if cookies == "none" else cookies, "gemini_model": model}
     if pro is not None:
         updates.update({k: (label in pro) for label, k in PRO_EDIT.items()})
+    if res in clipper.RESOLUTIONS:
+        updates["output_height"] = clipper.RESOLUTIONS[res]
+    if fps:
+        updates["output_fps"] = int(fps) if fps in ("60", "30") else "source"
+    if size in clipper.FILE_SIZES:   # the 1080p values; 1440p/4K scale max_bitrate up when rendering
+        updates.update({"file_size": size, **clipper.FILE_SIZES[size]})
     key_msg = ""
     k = (key_field or "").strip().strip('"\'')
     if k and "•" not in k:
@@ -665,6 +972,14 @@ CSS = """
 .set-card { border: 1px solid var(--border-color-primary); border-radius: 14px; padding: 16px 18px !important;
             background: var(--background-fill-secondary); margin-bottom: 14px; }
 .set-card h3 { margin: 0 0 2px; }
+.cl-stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; margin-top: 10px; }
+.cl-stats > div { border: 1px solid var(--border-color-primary); border-radius: 10px; padding: 6px 10px;
+                  display: flex; flex-direction: column; }
+.cl-stats span { font-size: .78rem; opacity: .7; }
+.cl-stats b { font-size: 1.15rem; font-variant-numeric: tabular-nums; }
+#files { min-height: 100%; }
+#live-start { font-size: 1.1rem !important; min-height: 52px !important; font-weight: 700; }
+#live-stop { min-height: 52px !important; }
 """
 
 # Enter in the link box starts the job; Shift+Enter adds a new line (Gradio's default is the reverse).
@@ -728,13 +1043,20 @@ def build() -> gr.Blocks:
         with gr.Tabs():
             # ---------------------------------------------------------------- Make clips
             with gr.Tab("✂️ Make Clips", id="make"):
-                gr.HTML('<div id="hero"><h1>✂️ Clipper</h1><p>Paste a YouTube or Twitch link, press '
-                        '<b>Make clips</b>, get vertical captioned clips.</p></div>')
+                gr.HTML('<div id="hero"><h1>✂️ Clipper</h1><p>Paste a YouTube or Twitch link (or drop video '
+                        'files), press <b>Make clips</b>, get vertical captioned clips.</p></div>')
                 with gr.Row(equal_height=True):
-                    links = gr.Textbox(label="Paste link(s)", lines=3, max_lines=10, scale=6, elem_id="links",
+                    links = gr.Textbox(label="Paste link(s)", lines=3, max_lines=10, scale=5, elem_id="links",
                                        placeholder="https://www.youtube.com/watch?v=...\nhttps://www.twitch.tv/videos/...",
                                        info="One link per line · Enter starts · Shift+Enter adds a line")
                     paste = gr.Button("📋 Paste from clipboard", scale=1, min_width=150, elem_id="paste-btn")
+                    files = gr.File(label="…or drop video files here", file_count="multiple", file_types=VIDEO_TYPES,
+                                    type="filepath", scale=3, height=150, elem_id="files")
+                with gr.Row():
+                    credit = gr.Textbox(label="Creator name (files)", placeholder="CreatorName", max_lines=1,
+                                        info="Credit line in each clip's description. Optional.")
+                    file_title = gr.Textbox(label="Title (files)", placeholder="the video's title", max_lines=1,
+                                            info="Used for the folder name and Gemini. Empty = the file name.")
                 with gr.Accordion("Options", open=False) as options:
                     with gr.Row():
                         campaign = gr.Dropdown(camp_names, value="none", label="Campaign",
@@ -757,6 +1079,39 @@ def build() -> gr.Blocks:
                     if clips:
                         gr.Markdown("### Your clips")
                     clip_cards(clips, "")
+
+            # ---------------------------------------------------------------- Live
+            with gr.Tab("🔴 Live", id="live"):
+                gr.HTML('<div id="hero"><h1>🔴 Live</h1><p>Clip a Twitch or YouTube stream while it\'s still '
+                        'live. It\'s recorded in 5-minute chunks; every time one closes, the last 10 minutes are '
+                        'clipped and the clips appear below.</p></div>')
+                with gr.Row(equal_height=True):
+                    live_url = gr.Textbox(label="Live link", scale=5, max_lines=1,
+                                          placeholder="https://www.twitch.tv/<channel>  or  https://www.youtube.com/watch?v=...",
+                                          info="A Twitch channel or a YouTube live stream")
+                    live_per = gr.Slider(1, 5, value=int(cfg.get("live_clips_per_window") or 2), step=1, scale=2,
+                                         label="Clips per window", info="from each 10-minute window")
+                with gr.Row():
+                    live_campaign = gr.Dropdown(camp_names, value="none", label="Campaign",
+                                                info="Source check, facecam layout and overlay still apply")
+                    live_lang = gr.Radio(LANGS, value="en", label="Language")
+                with gr.Row():
+                    live_go = gr.Button("🔴 Start", variant="primary", elem_id="live-start", scale=3)
+                    live_halt = gr.Button("⏹️ Stop", variant="stop", elem_id="live-stop", scale=1)
+                gr.Markdown("Stop ends the recording; the part already recorded is still clipped. Windows wait "
+                            "behind link/file jobs (one GPU job at a time).", elem_classes="empty-note")
+                live_status = gr.HTML()
+                with gr.Accordion("Live log", open=False):
+                    live_log = gr.Textbox(show_label=False, lines=14, max_lines=14, autoscroll=True,
+                                          interactive=False, elem_id="live-log")
+                live_state = gr.State([])
+                live_timer = gr.Timer(2.0)
+
+                @gr.render(inputs=live_state)
+                def _live_cards(clips):
+                    if clips:
+                        gr.Markdown(f"### Clips from this stream ({len(clips)})")
+                    clip_cards(list(reversed(clips)), "")
 
             # ---------------------------------------------------------------- History
             with gr.Tab("🕘 History", id="history") as history_tab:
@@ -807,6 +1162,20 @@ def build() -> gr.Blocks:
                                            info="Streams with a webcam: cam on top + gameplay below, a cut to the "
                                                 "streamer's face on the loudest reactions, and one big word behind "
                                                 "their head during the first one")
+                with gr.Column(elem_classes="set-card"):
+                    gr.Markdown("### 📐 Output quality")
+                    with gr.Row():
+                        res = gr.Radio(RES_CHOICES, value=res_label(cfg), label="Resolution",
+                                       info="1080p = 1080x1920 · 1440p = 1440x2560 · 4K = 2160x3840")
+                        fps = gr.Radio(FPS_CHOICES, value=str(cfg.get("output_fps") or "source"), label="Frame rate",
+                                       info=f"Source = the video's own rate (up to {int(cfg.get('max_fps') or 60)} fps)")
+                        fsize = gr.Radio(SIZE_CHOICES, value=size_choice(cfg), label="File size",
+                                         info="Smaller = faster uploads · Best = cleanest master")
+                    estimate = gr.Markdown(estimate_text(res_label(cfg), str(cfg.get("output_fps") or "source"),
+                                                         size_choice(cfg)))
+                    gr.Markdown("4K only adds real detail when the source is 1440p or higher (Twitch is 1080p), "
+                                "but YouTube encodes 4K uploads with a better codec, so they can still look "
+                                "cleaner after upload. 1440p and 4K take longer to render.", elem_classes="empty-note")
                 save_btn = gr.Button("💾 Save settings", variant="primary", size="lg")
                 settings_msg = gr.Markdown()
 
@@ -817,12 +1186,21 @@ def build() -> gr.Blocks:
             catch (e) { console.warn('Clipboard blocked - press Ctrl+V in the box instead.', e); return cur; } }""")
         links.change(detect, inputs=links, outputs=[campaign, section, options],
                      trigger_mode="always_last", show_progress="minimal")
-        run_args = dict(fn=start, inputs=[links, campaign, lang, n_clips, section],
+        run_args = dict(fn=start, inputs=[links, files, credit, file_title, campaign, lang, n_clips, section],
                         outputs=[log_box, status, clips_state, job_id],
                         concurrency_limit=1, concurrency_id="gpu", show_progress="minimal")
         make.click(**run_args)
         links.submit(**run_args)
         demo.load(reattach, outputs=[log_box, status, clips_state, job_id], show_progress="hidden")
+
+        # live
+        live_url.change(lambda t: detect(t)[0], inputs=live_url, outputs=live_campaign,
+                        trigger_mode="always_last", show_progress="hidden")
+        live_go.click(live_start, [live_url, live_campaign, live_lang, live_per], live_status, show_progress="minimal")
+        live_url.submit(live_start, [live_url, live_campaign, live_lang, live_per], live_status, show_progress="minimal")
+        live_halt.click(live_stop, None, live_status, show_progress="hidden")
+        live_timer.tick(live_tick, live_state, [live_status, live_log, live_state], show_progress="hidden",
+                        queue=False)
 
         def load_settings():   # fresh from config.json on every page load (never the startup values)
             c = read_config()
@@ -832,10 +1210,16 @@ def build() -> gr.Blocks:
                     c.get("output_root") or DEFAULT_OUT, int(c["min_clip_seconds"]), int(c["max_clip_seconds"]),
                     n, c.get("layout") or "auto", c.get("cookies_from_browser") or "none", n,
                     gr.update(choices=["none"] + list(campaigns())),
-                    [l for l, k in PRO_EDIT.items() if c.get(k, True)])
+                    [l for l, k in PRO_EDIT.items() if c.get(k, True)],
+                    res_label(c), str(c.get("output_fps") or "source"), size_choice(c),
+                    estimate_text(res_label(c), str(c.get("output_fps") or "source"), size_choice(c)),
+                    gr.update(choices=["none"] + list(campaigns())))
 
         demo.load(load_settings, outputs=[key, key_msg, model, folder, min_len, max_len, def_clips, layout,
-                                          cookies, n_clips, campaign, pro], show_progress="hidden")
+                                          cookies, n_clips, campaign, pro, res, fps, fsize, estimate, live_campaign],
+                  show_progress="hidden")
+        for q in (res, fps, fsize):
+            q.change(estimate_text, [res, fps, fsize], estimate, show_progress="hidden", queue=False)
         def_clips.change(lambda v: gr.update(value=v), def_clips, n_clips)
 
         def show_day(path):
@@ -857,8 +1241,8 @@ def build() -> gr.Blocks:
 
         save_key_btn.click(save_key, key, [key, key_msg])
         test_btn.click(test_key, [key, model], key_msg, show_progress="minimal")
-        save_btn.click(save_settings, [key, model, folder, min_len, max_len, def_clips, layout, cookies, pro],
-                       [key, settings_msg])
+        save_btn.click(save_settings, [key, model, folder, min_len, max_len, def_clips, layout, cookies, pro,
+                                       res, fps, fsize], [key, settings_msg])
     return demo
 
 
