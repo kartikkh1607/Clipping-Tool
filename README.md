@@ -94,11 +94,21 @@ The `skiimasktimmy` preset in `campaigns.json` enforces the campaign rules:
 7. **Gemini picks the final clips** from those scores, starts clutch plays a few seconds before the payoff, and writes the text. If the watching step fails, it falls back to text-only picking, and if Gemini is unavailable, to the automatic scores.
 8. **Every cut is checked again** after Gemini moves it: it never splits a word, it runs on to the end of the sentence when that's within 3 s, the payoff Gemini saw stays inside the clip, and the length stays within your min/max.
 
+## Pro edit (streams with a webcam)
+Streamer clips are edited the way pro clippers do it, automatically:
+1. **Split layout.** In the `auto` layout, a stream with a webcam in a corner (a small face that stays put and moves like a live cam) gets the facecam layout: the cam large on top, the gameplay below. Before, these got the blur layout, where the streamer was a tiny face in a thin strip. Turn off with `"auto_facecam": false`.
+2. **Face zooms on the big reactions.** The clip cuts to the streamer's face full-screen (a 9:16 crop of the cam) for 2 s on the loudest sudden jumps in sound: a scream, "NO WAY", chat going off. Up to 2 per clip, at least 6 s apart (`react_max`, `react_seconds`, `react_min_score`; off with `"react_zoom": false`). Skipped for campaigns with an overlay image, since the overlay would sit on the face.
+3. **A word behind the head.** During the first face zoom, one big word that sums up the moment ("SPIDER", "CLUTCH") pops in *behind* the streamer: each frame's person cut-out comes from OpenCV Zoo's PP-HumanSeg model (`models/`), and the word is drawn everywhere except on the person. Gemini picks the word (`punch_word` in its answer); without a key it's the strongest word spoken around the reaction. Swear words are never used. Off with `"punch_word": false`; colour with `punch_color`.
+4. **The hook box only for the hook.** The white banner shows for the first 3 s, then fades (`title_banner_seconds`, 0 = whole clip).
+5. **Clean captions.** Slurs and hard swears are masked in the captions (`N****`, `F******`); the audio is untouched. Off with `"censor_captions": false`.
+
+These are also switches in the app's **Settings → Pro edit**.
+
 ## How it keeps quality high
 1. **Two downloads.** The whole video is downloaded once for analysis (up to 1080p; Twitch 720p). After the clips are chosen, only those moments are downloaded again at the best quality the source has (YouTube up to 4K, Twitch "source" 1080p60). Downscaling 4K to 1080x1920 is what makes vertical crops sharp; before, a 1080p frame was enlarged 1.8x (Twitch 720p: 2.7x, facecam: 4.9x). The new footage is lined up with the first download by matching their audio, so cuts are exact to the frame. If the second download fails or can't be lined up, that clip is made from the first download, so nothing is lost.
 2. **SDR only.** HDR versions are skipped: converted to normal video they look washed out.
 3. **Source frame rate.** 60 fps gameplay stays 60 fps (capped by `max_fps`); 30 fps sources stay 30.
-4. **Encoder settings for a clean master.** YouTube re-encodes every upload, so the file it gets should be as clean as possible: NVIDIA: preset p7, constant quality 19, adaptive quantisation and lookahead; CPU: x264 `slow`, CRF 18. Lanczos scaling, BT.709 colour tags, a keyframe every 2 s.
+4. **Encoder settings for a clean master.** YouTube re-encodes every upload, so the file it gets should be clean, but past ~20 Mbps the extra size only costs upload time: NVIDIA: preset p7, constant quality 22, adaptive quantisation and lookahead; CPU: x264 `slow`, CRF 20; both capped at 20 Mbps (`max_bitrate`). Lanczos scaling, BT.709 colour tags, a keyframe every 2 s.
 5. **Audio.** Each clip's loudness is measured first, then one steady gain brings it to -14 LUFS (a fast limiter only catches peaks), so the volume doesn't pump. Tiny fades at the cut points stop clicks. AAC 192k, 48 kHz.
 6. **Layouts that follow people** (`layout`):
    - `auto` (default): on talking-head clips (podcasts, interviews, reactions) a 9:16 crop follows the speaker: it holds still while they stay near the middle, pans when they drift, and cuts on the same frame as the video's own camera switches. Everything else gets `blur`.
@@ -126,11 +136,16 @@ Use `--lang hi` (or answer `hi` in `run_clipper.bat`). Whisper transcribes in Hi
 | `hq_max_height` / `twitch_hq_max_height` | 2160 / 1080 | cap for that high-quality download |
 | `max_fps` | 60 | clips keep the source frame rate up to this |
 | `encoder` | auto | `auto` (NVIDIA GPU if it works, else CPU), `nvenc` or `x264` |
-| `nvenc_cq` / `x264_crf` / `x264_preset` | 19 / 18 / slow | encoder quality (lower = better and bigger); `x264_preset` `medium` is faster |
+| `nvenc_cq` / `x264_crf` / `x264_preset` | 22 / 20 / slow | encoder quality (lower = better and bigger); `x264_preset` `medium` is faster |
+| `max_bitrate` | 20M | video bitrate cap |
 | `audio_bitrate` / `target_lufs` | 192k / -14 | audio quality and loudness target |
 | `qa_check` | true | check every clip after rendering (and re-render broken ones) |
 | `zoom` | 1.25 | how much to enlarge the gameplay in the blur layout |
 | `show_title_banner` | true | white hook box at the top (needs a Gemini key) |
+| `title_banner_seconds` | 3 | how long the hook box stays up (0 = whole clip) |
+| `censor_captions` | true | mask slurs and hard swears in captions |
+| `auto_facecam` / `react_zoom` / `punch_word` | true | Pro edit for streams with a webcam (see above) |
+| `react_max` / `react_seconds` / `react_min_score` | 2 / 2.0 / 0.35 | face zooms per clip, their length, how sudden the reaction must be |
 | `words_per_caption` | 3 | words shown at once |
 | `whisper_model` | large-v3-turbo | speech model (GPU); falls back to `whisper_cpu_model` (`small`) on CPU automatically, and always on a Mac |
 | `whisper_batch_size` | 8 | GPU batched transcription (several chunks at once, much faster on long videos); lower to 4, or 1 = off, if the GPU runs out of memory |
