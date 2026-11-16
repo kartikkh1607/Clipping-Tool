@@ -45,6 +45,12 @@ HOST, PORT = "127.0.0.1", 7860
 GEMINI_MODELS = ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-3.8-flash"]  # free-tier order (clipper.DEFAULTS)
 LANGS = [("English", "en"), ("Hindi", "hi"), ("Auto", "auto")]
 LAYOUTS = ["auto", "blur", "crop", "facecam"]
+PRO_EDIT = {   # Settings checkbox label -> config.json key
+    "Split layout for streams (auto)": "auto_facecam",
+    "Face zooms on big reactions": "react_zoom",
+    "Word behind the streamer's head": "punch_word",
+    "Censor slurs in captions": "censor_captions",
+}
 DATE_DIR = re.compile(r"^\d{2}-\d{2}-\d{4}$")
 
 
@@ -586,7 +592,7 @@ def check_folder(path: str) -> tuple[bool, str]:
         return False, f"Can't use that folder: {e}"
 
 
-def save_settings(key_field, model, folder, min_len, max_len, clips, layout, cookies):
+def save_settings(key_field, model, folder, min_len, max_len, clips, layout, cookies, pro=None):
     errors = []
     ok, folder_msg = check_folder(folder)
     if not ok:
@@ -608,6 +614,8 @@ def save_settings(key_field, model, folder, min_len, max_len, clips, layout, coo
     updates = {"output_root": str(Path(folder.strip().strip('"'))), "min_clip_seconds": min_len,
                "max_clip_seconds": max_len, "num_clips": int(clips), "layout": layout,
                "cookies_from_browser": "" if cookies == "none" else cookies, "gemini_model": model}
+    if pro is not None:
+        updates.update({k: (label in pro) for label, k in PRO_EDIT.items()})
     key_msg = ""
     k = (key_field or "").strip().strip('"\'')
     if k and "•" not in k:
@@ -794,6 +802,11 @@ def build() -> gr.Blocks:
                                                "background · crop = 9:16 crop that follows faces · facecam = cam on top")
                         cookies = gr.Radio(["firefox", "chrome", "safari", "none"], value=cfg.get("cookies_from_browser") or "none",
                                            label="Cookies browser", info="YouTube bot check: read cookies from this browser")
+                    pro = gr.CheckboxGroup(list(PRO_EDIT), label="Pro edit",
+                                           value=[l for l, k in PRO_EDIT.items() if cfg.get(k, True)],
+                                           info="Streams with a webcam: cam on top + gameplay below, a cut to the "
+                                                "streamer's face on the loudest reactions, and one big word behind "
+                                                "their head during the first one")
                 save_btn = gr.Button("💾 Save settings", variant="primary", size="lg")
                 settings_msg = gr.Markdown()
 
@@ -818,10 +831,11 @@ def build() -> gr.Blocks:
             return (mask_key(k), key_status(k), c.get("gemini_model") or GEMINI_MODELS[0],
                     c.get("output_root") or DEFAULT_OUT, int(c["min_clip_seconds"]), int(c["max_clip_seconds"]),
                     n, c.get("layout") or "auto", c.get("cookies_from_browser") or "none", n,
-                    gr.update(choices=["none"] + list(campaigns())))
+                    gr.update(choices=["none"] + list(campaigns())),
+                    [l for l, k in PRO_EDIT.items() if c.get(k, True)])
 
         demo.load(load_settings, outputs=[key, key_msg, model, folder, min_len, max_len, def_clips, layout,
-                                          cookies, n_clips, campaign], show_progress="hidden")
+                                          cookies, n_clips, campaign, pro], show_progress="hidden")
         def_clips.change(lambda v: gr.update(value=v), def_clips, n_clips)
 
         def show_day(path):
@@ -843,7 +857,7 @@ def build() -> gr.Blocks:
 
         save_key_btn.click(save_key, key, [key, key_msg])
         test_btn.click(test_key, [key, model], key_msg, show_progress="minimal")
-        save_btn.click(save_settings, [key, model, folder, min_len, max_len, def_clips, layout, cookies],
+        save_btn.click(save_settings, [key, model, folder, min_len, max_len, def_clips, layout, cookies, pro],
                        [key, settings_msg])
     return demo
 

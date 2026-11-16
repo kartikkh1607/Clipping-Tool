@@ -117,7 +117,29 @@ def test_banner_cannot_inject_ass_codes(tmp_path):
     cfg = {**clipper.DEFAULTS, "_layout": "blur"}
     clipper.write_captions(clip, [], cfg, tmp_path / "c.ass", tmp_path / "c.srt")
     line = [l for l in (tmp_path / "c.ass").read_text().splitlines() if ",Banner," in l][0]
-    assert line.endswith(",HE DID B0NOT SEE THAT")
+    assert line.endswith(",{\\fad(0,150)}HE DID B0NOT SEE THAT")   # only our own fade tag survives
+
+
+def test_banner_shows_only_for_the_hook(tmp_path):
+    clip = {"start": 10.0, "end": 30.0, "banner": "NO WAY", "words": []}
+    for secs, end in ((3, "0:00:03.00"), (0, "0:00:20.00")):
+        cfg = {**clipper.DEFAULTS, "_layout": "blur", "title_banner_seconds": secs}
+        clipper.write_captions(clip, [], cfg, tmp_path / "c.ass", tmp_path / "c.srt")
+        line = [l for l in (tmp_path / "c.ass").read_text().splitlines() if ",Banner," in l][0]
+        assert line.split(",")[2] == end
+
+
+def test_captions_mask_slurs_but_keep_normal_words(tmp_path):
+    words = [[0.5, 0.9, " what"], [0.9, 1.3, " nigga!"], [1.3, 1.6, " fucking"], [2.5, 2.9, " Dickens"],
+             [2.9, 3.3, " cockpit"], [3.3, 3.6, " class"]]
+    clip = {"start": 0.0, "end": 5.0, "banner": "", "words": words}
+    cfg = {**clipper.DEFAULTS, "_layout": "blur"}
+    clipper.write_captions(clip, [], cfg, tmp_path / "c.ass", tmp_path / "c.srt")
+    srt = (tmp_path / "c.srt").read_text()
+    assert "N****!" in srt and "F******" in srt and "NIGGA" not in srt
+    assert "DICKENS" in srt and "COCKPIT" in srt and "CLASS" in srt
+    clipper.write_captions(clip, [], {**cfg, "censor_captions": False}, tmp_path / "c.ass", tmp_path / "c.srt")
+    assert "NIGGA!" in (tmp_path / "c.srt").read_text()
 
 
 # ----------------------------------------------------------------------------- Gemini picks

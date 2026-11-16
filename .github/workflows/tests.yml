@@ -12,6 +12,6 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Install Python packages
         # the GPU/Whisper/Gemini/Gradio packages aren't needed: the tests use generated footage
-        run: pip install "numpy<3" "opencv-python-headless<6" "yt-dlp[default]" pytest
+        run: pip install "numpy<3" "opencv-python-headless<6" "pillow<13" "yt-dlp[default]" pytest
       - name: Run tests
         run: python -m pytest tests -q

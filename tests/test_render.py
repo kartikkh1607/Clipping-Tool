@@ -98,3 +98,41 @@ def test_full_pipeline_on_a_local_file(media, tmp_path):
         txt = m.with_suffix(".txt").read_text()
         assert "Quality check: passed" in txt and "from the original file" in txt
     assert not (tmp_path / "_work").exists()
+
+
+def test_facecam_face_zoom_and_punch_word(media, tmp_path):
+    """Face zooms cut to the cam full-screen for their window; the punch word is overlaid in the first one."""
+    extra = {"_cam_box_n": (0.77, 0.72, 0.21, 0.2), "_cam_crop_n": (0.79, 0.72, 0.17, 0.2), "_face_n": None,
+             "_react": [(1.0, 3.0), (5.0, 6.5)], "_punch_word": "SPIDER"}
+    out, clip = render(media, tmp_path, "facecam", extra)
+    v = next(s for s in probe(out)["streams"] if s["codec_type"] == "video")
+    assert (v["width"], v["height"], v["r_frame_rate"]) == (1080, 1920, "60/1")
+    assert clipper.qa_check(out, 8.0, 60.0, True) == ([], [])
+    assert clip["_punch"].startswith("'SPIDER'")
+    assert not list(tmp_path.glob(".*_punch.mov"))          # the temporary word video is cleaned up
+
+    def frame(t):
+        raw = subprocess.run(["ffmpeg", "-v", "error", "-ss", str(t), "-i", str(out), "-frames:v", "1",
+                              "-vf", "scale=108:192", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                             capture_output=True).stdout
+        import numpy as np
+        return np.frombuffer(raw, np.uint8).reshape(192, 108).astype(float)
+    split, zoom = frame(0.5), frame(2.0)
+    band = slice(73, 86)    # the dark band between cam and gameplay in the split layout
+    assert split[band].mean() < 40 and zoom[band].mean() > split[band].mean() + 20
+
+
+def test_reaction_picking_and_punch_word():
+    import numpy as np
+    import reactfx
+    spike = np.zeros(60)
+    spike[[12, 14, 30]] = [0.9, 0.7, 0.6]
+    loud = np.zeros(60)
+    loud[[13, 31]] = 1.0
+    r = reactfx.pick_reactions(spike, loud, None, 10.0, 40.0, n=2, seconds=2.0, min_score=0.35, min_gap=6)
+    assert r == [(2.75, 4.75), (20.75, 22.75)]                # strongest first; 14 s is too close to 12 s
+    assert reactfx.pick_reactions(spike, loud, None, 40.0, 60.0) == []   # nothing loud in this clip
+    words = [[2.0, 2.3, " no"], [2.3, 2.9, " spider!"], [3.0, 3.4, " bro"], [3.4, 3.9, " fucking"]]
+    assert reactfx.pick_punch_word("", words, 2.75, 4.75) == "SPIDER"
+    assert reactfx.pick_punch_word("Clutch", words, 2.75, 4.75) == "CLUTCH"
+    assert reactfx.pick_punch_word("shit", words, 2.75, 4.75) == "SPIDER"   # no swearing on screen

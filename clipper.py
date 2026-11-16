@@ -42,6 +42,7 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:   # framing.py sits next to this file, whatever folder we're started from
     sys.path.insert(0, str(HERE))
 import framing  # noqa: E402
+import reactfx  # noqa: E402
 CONFIG_PATH = HERE / "config.json"
 
 IS_WINDOWS = os.name == "nt"
@@ -64,6 +65,15 @@ DEFAULTS = {
                                  # "facecam" = facecam on top + gameplay below
     "zoom": 1.25,                # blur layout: how much to enlarge the gameplay (1.0 = fit width)
     "show_title_banner": True,   # hook text box at the top of the clip
+    "title_banner_seconds": 3,   # how long the hook box stays up (0 = the whole clip)
+    "censor_captions": True,     # mask slurs and hard swears in the captions (N****); the audio is untouched
+    "auto_facecam": True,        # "auto" layout: streams with a webcam in a corner get the split facecam layout
+    "react_zoom": True,          # facecam layout: cut to the streamer's face full-screen on the biggest reactions
+    "react_max": 2,              # face zooms per clip
+    "react_seconds": 2.0,        # length of each face zoom
+    "react_min_score": 0.35,     # how sudden a sound jump must be to count as a reaction (0-1)
+    "punch_word": True,          # one big word BEHIND the streamer's head during the first face zoom
+    "punch_color": "#FFFFFF",
     "words_per_caption": 3,
     "caption_font": _FONT,
     "caption_size": 84,
@@ -84,8 +94,9 @@ DEFAULTS = {
     "twitch_hq_max_height": 1080,        # Twitch: "source" quality is usually 1080p60
     "max_fps": 60,                       # keep the source frame rate up to this (YouTube Shorts plays 60 fps)
     "encoder": "auto",                   # auto (NVIDIA GPU if it works, else CPU) | nvenc | x264
-    "nvenc_cq": 19,                      # GPU encoder quality (lower = better, bigger files)
-    "x264_crf": 18,                      # CPU encoder quality (lower = better, bigger files)
+    "nvenc_cq": 22,                      # GPU encoder quality (lower = better, bigger files)
+    "x264_crf": 20,                      # CPU encoder quality (lower = better, bigger files)
+    "max_bitrate": "20M",                # cap: YouTube re-encodes everything, more than ~20 Mbps is just upload time
     "x264_preset": "slow",               # CPU encoder effort: slower = better quality per MB
     "audio_bitrate": "192k",
     "target_lufs": -14,                  # loudness target (YouTube/TikTok normalise around -14)
@@ -1171,9 +1182,11 @@ For each clip write:
 - description: 1-2 short sentences about the moment
 - hashtags: 5 relevant hashtags without spaces
 - reason: why this moment is strong
+- punch_word: ONE word (max 12 letters, English, no swearing) that sums up the reaction, shown huge
+  behind the streamer's head when he reacts, e.g. "SPIDER", "CLUTCH", "BETRAYED", "JUMPSCARE"
 {lang_note}
 Return JSON: {{"clips": [{{"id": int, "start": float, "end": float, "title": str, "banner": str,
-"description": str, "hashtags": [str], "reason": str{camp_fields}}}]}} ordered best first.
+"description": str, "hashtags": [str], "reason": str, "punch_word": str{camp_fields}}}]}} ordered best first.
 
 Candidates:
 {json.dumps(items, ensure_ascii=False)}"""
@@ -1209,7 +1222,7 @@ Candidates:
                         "title": str(c.get("title", ""))[:100], "banner": str(c.get("banner", ""))[:60],
                         "description": str(c.get("description", "")),
                         "hashtags": [str(h).lstrip("#").replace(" ", "") for h in c.get("hashtags", [])][:8],
-                        "reason": str(c.get("reason", "")),
+                        "reason": str(c.get("reason", "")), "punch_word": str(c.get("punch_word", ""))[:20],
                         "format": str(c.get("format", "")), "game": str(c.get("game", ""))})
             if cfg.get("campaign"):  # hard cap: banners are hooks, not sentences
                 out[-1]["banner"] = " ".join(out[-1]["banner"].split()[:6])
@@ -1440,7 +1453,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     banner = re.sub(r"\\[Nnh]", " ", clip.get("banner") or "")
     banner = re.sub(r"\s+", " ", re.sub(r"[{}\\]", "", banner)).strip().upper()
     if cfg.get("show_title_banner") and banner:
-        lines.append(f"Dialogue: 1,{ass_time(0)},{ass_time(dur)},Banner,,0,0,0,,{banner}")
+        secs = float(cfg.get("title_banner_seconds") or 0)
+        b_end = min(dur, secs) if secs > 0 else dur   # a hook, not a label: gone once the moment starts
+        lines.append(f"Dialogue: 1,{ass_time(0)},{ass_time(b_end)},Banner,,0,0,0,,{{\\fad(0,150)}}{banner}")
 
     words = [[w[0] - s0, w[1] - s0, w[2]] for w in (clip.get("words") or words_in(segments, s0, s1))]
     words = [w for w in words if w[1] > 0 and w[0] < dur]
@@ -1452,6 +1467,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         if i + 1 < len(chunks):
             c_end = min(c_end, chunks[i + 1][0][0])
         tokens = [clean_word(w[2], upper=not hindi) for w in ch]
+        if cfg.get("censor_captions", True):
+            tokens = [reactfx.mask_word(t) for t in tokens]
         for j, w in enumerate(ch):
             start = max(0.0, w[0])
             end = ch[j + 1][0] if j + 1 < len(ch) else c_end
@@ -1475,16 +1492,19 @@ def encoder_args(kind: str, cfg: dict, fps: float) -> list[str]:
     """Video encoder settings. YouTube re-encodes every upload, so the file we hand it should be a clean,
     high-bitrate master: quality-targeted rate control, adaptive quantisation, a keyframe every 2 s."""
     gop = str(max(1, int(round(fps * 2))))
-    cq = str(cfg.get("nvenc_cq", 19))
+    cq = str(cfg.get("nvenc_cq", 22))
+    mx = str(cfg.get("max_bitrate") or "20M")
+    m = re.match(r"^(\d+(?:\.\d+)?)([kKmM]?)$", mx)
+    buf = f"{float(m.group(1)) * 2:g}{m.group(2)}" if m else mx
     if kind == "nvenc":
         return ["-c:v", "h264_nvenc", "-preset", "p7", "-tune", "hq", "-rc", "vbr", "-cq", cq, "-b:v", "0",
-                "-maxrate", "40M", "-bufsize", "80M", "-spatial-aq", "1", "-temporal-aq", "1",
+                "-maxrate", mx, "-bufsize", buf, "-spatial-aq", "1", "-temporal-aq", "1",
                 "-rc-lookahead", "32", "-bf", "3", "-profile:v", "high", "-g", gop]
     if kind == "nvenc_basic":  # older GPUs/drivers that reject lookahead or AQ
         return ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", cq, "-b:v", "0",
-                "-maxrate", "40M", "-bufsize", "80M", "-profile:v", "high", "-g", gop]
-    return ["-c:v", "libx264", "-preset", str(cfg.get("x264_preset", "slow")), "-crf", str(cfg.get("x264_crf", 18)),
-            "-profile:v", "high", "-x264-params", "aq-mode=3", "-g", gop]
+                "-maxrate", mx, "-bufsize", buf, "-profile:v", "high", "-g", gop]
+    return ["-c:v", "libx264", "-preset", str(cfg.get("x264_preset", "slow")), "-crf", str(cfg.get("x264_crf", 20)),
+            "-maxrate", mx, "-bufsize", buf, "-profile:v", "high", "-x264-params", "aq-mode=3", "-g", gop]
 
 
 def pick_encoder(cfg: dict | None = None) -> str:
@@ -1508,7 +1528,7 @@ def pick_encoder(cfg: dict | None = None) -> str:
             log({"nvenc": "Using NVIDIA GPU encoder (h264_nvenc, high-quality settings)",
                  "nvenc_basic": "Using NVIDIA GPU encoder (h264_nvenc, basic settings)",
                  "x264": f"Using CPU encoder (libx264, preset {cfg.get('x264_preset', 'slow')}, "
-                         f"CRF {cfg.get('x264_crf', 18)})"}[choice])
+                         f"CRF {cfg.get('x264_crf', 20)})"}[choice])
         return _ENCODER[want]
 
 
@@ -1576,8 +1596,10 @@ def overlay_geometry(cfg: dict, layout: str) -> tuple[int, int, int] | None:
     return w, h, y
 
 
-def video_chain(layout: str, cfg: dict, sw: int, sh: int, fps_str: str) -> str:
-    """filter_complex for the picture, ending in [v0] (1080x1920, bt709, yuv420p, source frame rate)."""
+def video_chain(layout: str, cfg: dict, sw: int, sh: int, fps_str: str, punch_input: int | None = None) -> str:
+    """filter_complex for the picture, ending in [v0] (1080x1920, bt709, yuv420p, source frame rate).
+    facecam: cfg["_react"] [(a, b), ...] cuts to the face full-screen for those clip seconds; punch_input is
+    the ffmpeg input index of the transparent "word behind the head" video for the first of them."""
     even = lambda v: int(v) // 2 * 2
     head = (f"[0:v]fps={fps_str},scale=in_color_matrix=auto:out_color_matrix=bt709:out_range=tv,"
             f"format=yuv420p")
@@ -1595,12 +1617,26 @@ def video_chain(layout: str, cfg: dict, sw: int, sh: int, fps_str: str) -> str:
         else:
             gx = min(sw - gw, max(gx, int(bx + bw + pad)))
         gx = even(gx)
-        return (f"{head},split=2[cam][game];"
-                f"[cam]crop={cw}:{ch}:{cx}:{cy},scale=1080:{FC_CAM_H}:{SCALE},unsharp=5:5:0.5,"
-                f"pad=1080:1920:0:0:color={FC_BAND_COLOR}[base];"
-                f"[game]crop={gw}:{sh}:{gx}:0,scale=1080:{game_h}:force_original_aspect_ratio=increase:{SCALE},"
-                f"crop=1080:{game_h}[g];"
-                f"[base][g]overlay=0:{FC_GAME_Y}[v0]")
+        react = cfg.get("_react") or []
+        rc = react_crop_px(cfg, sw, sh) if react else None
+        split = (f"{head},split=3[cam][game][rx];" if rc else f"{head},split=2[cam][game];")
+        chain = (f"{split}"
+                 f"[cam]crop={cw}:{ch}:{cx}:{cy},scale=1080:{FC_CAM_H}:{SCALE},unsharp=5:5:0.5,"
+                 f"pad=1080:1920:0:0:color={FC_BAND_COLOR}[base];"
+                 f"[game]crop={gw}:{sh}:{gx}:0,scale=1080:{game_h}:force_original_aspect_ratio=increase:{SCALE},"
+                 f"crop=1080:{game_h}[g];"
+                 f"[base][g]overlay=0:{FC_GAME_Y}" + ("[vs]" if rc else "[v0]"))
+        if not rc:
+            return chain
+        on = "+".join(f"between(t\\,{a:.3f}\\,{b:.3f})" for a, b in react)
+        x, y, w, h = rc
+        chain += (f";[rx]crop={w}:{h}:{x}:{y},scale=1080:1920:{SCALE},unsharp=5:5:0.7[rz];"
+                  f"[vs][rz]overlay=0:0:enable={on}")
+        if punch_input is None:
+            return chain + "[v0]"
+        a, b = react[0]
+        return (chain + f"[vr];[{punch_input}:v]format=rgba,setpts=PTS-STARTPTS+{a:.3f}/TB[pw];"
+                f"[vr][pw]overlay=0:0:eof_action=pass:enable=between(t\\,{a:.3f}\\,{b:.3f})[v0]")
     if layout == "crop":
         cw = even(sh * 1080 / 1920)
         if cw >= sw:   # source already 9:16 or narrower: fill the frame
@@ -1631,8 +1667,20 @@ def render_clip(src: Path, clip: dict, folder: Path, base: str, cfg: dict, audio
     fps_str, fps = output_fps(probe_fps(src), float(cfg.get("max_fps") or 60))
     start = max(0.0, clip["start"] - t0)
     dur = clip["end"] - clip["start"]
-    chain = video_chain(layout, cfg, sw, sh, fps_str)
     ov = overlay_geometry(cfg, layout)
+    punch = None
+    react = cfg.get("_react") if layout == "facecam" else None
+    if react and cfg.get("_punch_word"):
+        rc = react_crop_px(cfg, sw, sh)
+        a, b = react[0]
+        if rc:
+            punch = reactfx.word_overlay(src, start + a, b - a, fps_str, fps, rc, cfg["_punch_word"],
+                                         folder / f".{base}_punch.mov", str(cfg.get("punch_color") or "#FFFFFF"))
+            if punch:
+                clip["_punch"] = f"'{cfg['_punch_word']}' " + ("behind the head" if punch["behind"] else
+                                                                "in front (no person-cutout model)")
+    punch_idx = (2 if ov else 1) if punch else None
+    chain = video_chain(layout, cfg, sw, sh, fps_str, punch_idx)
     if ov:
         chain += f";[1:v]scale={ov[0]}:{ov[1]}:{SCALE}[ov];[v0][ov]overlay=(W-w)/2:{ov[2]}[v1]"
     # tag the frames themselves as BT.709: FFmpeg 7.1+ takes the encoder's colour info from the frames and
@@ -1642,6 +1690,8 @@ def render_clip(src: Path, clip: dict, folder: Path, base: str, cfg: dict, audio
     head = ["ffmpeg", "-y", "-v", "error", "-ss", f"{start:.3f}", "-i", str(src)]
     if ov:
         head += ["-i", cfg["overlay_image"]]
+    if punch:
+        head += ["-i", str(punch["path"])]
     tail = ["-pix_fmt", "yuv420p", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
             "-color_range", "tv"]
     if audio:  # the source's own audio only, loudness-normalised, with tiny fades so cuts don't click
@@ -1665,6 +1715,9 @@ def render_clip(src: Path, clip: dict, folder: Path, base: str, cfg: dict, audio
         cmd = head + ["-t", f"{dur:.3f}", "-filter_complex", chain, "-map", "[vout]",
                       *encoder_args("x264", cfg, fps)] + tail
         run(cmd, cwd=folder)
+    finally:
+        if punch:
+            Path(punch["path"]).unlink(missing_ok=True)
     clip["_fps"] = fps
     return folder / out_name
 
@@ -1801,48 +1854,91 @@ def overlaps(c: dict, others: list[dict], gap: float = 1.0) -> bool:
     return any(not (c["end"] + gap <= x["start"] or c["start"] >= x["end"] + gap) for x in others)
 
 
+def _face_in(seen: list, box: tuple, sw: int, sh: int) -> tuple[float, float, float] | None:
+    """Median (cx, cy, h), normalised, of the faces seen inside box (source pixels)."""
+    x, y, w, h = box
+    pts = [f for faces in seen for f in faces
+           if x <= f[0] * sw <= x + w and y <= f[1] * sh <= y + h]
+    if not pts:
+        return None
+    return tuple(float(np.median([f[k] for f in pts])) for k in (0, 1, 3))
+
+
+def react_crop_px(cfg: dict, sw: int, sh: int) -> tuple[int, int, int, int] | None:
+    """9:16 crop (x, y, w, h source pixels) of the facecam, centred on the face: the full-screen face zoom."""
+    n = cfg.get("_cam_crop_n")
+    if not n:
+        return None
+    even = lambda v: int(v) // 2 * 2
+    cx, cy, cw, ch = n[0] * sw, n[1] * sh, n[2] * sw, n[3] * sh
+    w, h = ch * 9 / 16, ch
+    if w > cw:                     # a tall cam: use its full width instead
+        w, h = cw, cw * 16 / 9
+    face = cfg.get("_face_n")
+    fx = face[0] * sw if face else cx + cw / 2
+    fy = face[1] * sh if face else cy + ch / 2
+    x = min(max(fx - w / 2, cx), cx + cw - w)
+    y = min(max(fy - h * 0.42, cy), cy + ch - h)
+    w, h = max(2, even(w)), max(2, even(h))
+    return even(x), even(y), w, h
+
+
+def _cam_plan(rank: int, clip: dict, src: Path, sw: int, sh: int, cfg: dict, box, must_find: bool = False):
+    """Facecam layout settings for one clip, or None. box: the configured cam (source px) or None.
+    The configured box is checked for a face; if there is none, a moved cam is searched for.
+    must_find: only accept a cam found in the footage (the auto layout has no configured box)."""
+    s, e = clip["start"], clip["end"]
+    use_faces = cfg.get("face_tracking", True) and framing.detector().ok
+    found, seen = None, []
+    if use_faces:
+        times = [s + 1.5, s + (e - s) * 0.25, (s + e) / 2, s + (e - s) * 0.75, e - 1.5]
+        det = framing.detector()
+        frames = framing.frames_at(src, times, sw, sh)
+        seen = [det.detect(img) for _, img in frames]
+        if not (box and framing.face_in_box(seen, box, sw, sh)):
+            loc = framing.locate_facecam(seen)
+            if loc:
+                cand = framing.cam_box_from_face(*loc, sw, sh)
+                if framing.region_is_live(frames, cand, sw, sh):   # a webcam moves; a HUD portrait doesn't
+                    found = cand
+    if must_find and not found:
+        return None
+    if found:
+        if box:
+            log(f"  clip {rank}: no face in the configured facecam box - found the cam at "
+                f"x={found[0]}, y={found[1]} ({sw}x{sh}) and used that")
+        box = found
+    elif box:
+        crop = fit_cam_crop(box, sw, sh)
+        mid = (s + e) / 2
+        if not crop or not facecam_visible(src, crop, [s + 2, mid, e - 2]):
+            log(f"  clip {rank}: facecam not found in its box - using the blur layout")
+            box = None
+    crop = fit_cam_crop(box, sw, sh) if box else None
+    if not crop:
+        return None
+    return {"_layout": "facecam",
+            "_cam_box_n": (box[0] / sw, box[1] / sh, box[2] / sw, box[3] / sh),
+            "_cam_crop_n": (crop[0] / sw, crop[1] / sh, crop[2] / sw, crop[3] / sh),
+            "_face_n": _face_in(seen, crop, sw, sh)}
+
+
 def plan_framing(rank: int, clip: dict, src: Path, sw: int, sh: int, cfg: dict) -> dict:
     """Per-clip layout decision, made on the analysis copy. Returns the extra render settings:
-    _layout, and _track (tracked crop) or _cam_box_n/_cam_crop_n (facecam), all in 0-1 coordinates."""
+    _layout, and _track (tracked crop) or _cam_box_n/_cam_crop_n/_face_n (facecam), all in 0-1 coordinates."""
     layout = cfg["layout"]
     s, e = clip["start"], clip["end"]
     use_faces = cfg.get("face_tracking", True) and framing.detector().ok
     if layout == "facecam":
-        box = facecam_box_px(cfg, sw, sh)
-        found = None
-        if use_faces:
-            times = [s + 1.5, s + (e - s) * 0.25, (s + e) / 2, s + (e - s) * 0.75, e - 1.5]
-            det = framing.detector()
-            frames = framing.frames_at(src, times, sw, sh)
-            seen = [det.detect(img) for _, img in frames]
-            if not (box and framing.face_in_box(seen, box, sw, sh)):
-                loc = framing.locate_facecam(seen)
-                if loc:
-                    cand = framing.cam_box_from_face(*loc, sw, sh)
-                    if framing.region_is_live(frames, cand, sw, sh):   # a webcam moves; a HUD portrait doesn't
-                        found = cand
-        if found:
-            if box:
-                log(f"  clip {rank}: no face in the configured facecam box - found the cam at "
-                    f"x={found[0]}, y={found[1]} ({sw}x{sh}) and used that")
-            box = found
-        elif box:
-            crop = fit_cam_crop(box, sw, sh)
-            mid = (s + e) / 2
-            if not crop or not facecam_visible(src, crop, [s + 2, mid, e - 2]):
-                log(f"  clip {rank}: facecam not found in its box - using the blur layout")
-                box = None
-        crop = fit_cam_crop(box, sw, sh) if box else None
-        if not crop:
+        plan = _cam_plan(rank, clip, src, sw, sh, cfg, facecam_box_px(cfg, sw, sh))
+        if not plan:
             if not facecam_box_px(cfg, sw, sh) and not cfg.get("_cam_warned"):
                 log("No usable facecam box for this video - using the blur layout (full frame keeps the facecam visible)")
                 cfg["_cam_warned"] = True
             return {"_layout": "blur"}
-        return {"_layout": "facecam",
-                "_cam_box_n": (box[0] / sw, box[1] / sh, box[2] / sw, box[3] / sh),
-                "_cam_crop_n": (crop[0] / sw, crop[1] / sh, crop[2] / sw, crop[3] / sh)}
+        return plan
     if layout in ("auto", "crop"):
-        plan = None
+        plan, track = None, []
         if use_faces:
             track = framing.face_track(src, s, e - s, sw, sh)
             plan = framing.plan_tracked_crop(track, sw, sh, auto=(layout == "auto"))
@@ -1853,6 +1949,12 @@ def plan_framing(rank: int, clip: dict, src: Path, sw: int, sh: int, cfg: dict) 
                 moves = (len(plan["points"]) - 1) // 2
                 log(f"  clip {rank}: talking head - speaker-tracked crop ({moves} camera move{'s' * (moves != 1)})")
                 return {"_layout": "crop", "_track": plan["points"]}
+            mains = [max(f, key=lambda a: a[2] * a[3]) for _, f in track if f]
+            if cfg.get("auto_facecam", True) and framing._is_corner_cam(mains):
+                cam = _cam_plan(rank, clip, src, sw, sh, cfg, None, must_find=True)
+                if cam:
+                    log(f"  clip {rank}: stream with a facecam - split layout (cam on top, gameplay below)")
+                    return cam
             return {"_layout": "blur"}
         return {"_layout": "crop", "_track": plan["points"] if plan else None}
     return {"_layout": layout}
@@ -1970,6 +2072,24 @@ def _process(source: str, cfg: dict, local: bool, credit: str, local_title: str,
 
     def render_one(rank: int, clip: dict) -> str:
         ccfg = {**cfg, **plan_framing(rank, clip, src, sw, sh, cfg)}  # per clip: renders run in parallel
+        if ccfg["_layout"] == "facecam" and cfg.get("react_zoom", True):
+            if cfg.get("overlay_image"):   # campaign overlay sits mid-frame: it would cover the face zoom
+                if not cfg.get("_react_warned"):
+                    log("Face zooms are off for clips with an overlay image (it would sit on the face)")
+                    cfg["_react_warned"] = True
+            else:
+                ccfg["_react"] = reactfx.pick_reactions(
+                    spike, loud, hype, clip["start"], clip["end"], int(cfg.get("react_max", 2)),
+                    float(cfg.get("react_seconds", 2.0)), float(cfg.get("react_min_score", 0.35)))
+                if ccfg["_react"] and cfg.get("punch_word", True):
+                    a, b = ccfg["_react"][0]
+                    rel = [[w[0] - clip["start"], w[1] - clip["start"], w[2]] for w in
+                           (clip.get("words") or words_in(segments, clip["start"], clip["end"]))]
+                    ccfg["_punch_word"] = reactfx.pick_punch_word(clip.get("punch_word", ""), rel, a, b)
+                if ccfg["_react"]:
+                    log(f"  clip {rank}: {len(ccfg['_react'])} face zoom(s) at "
+                        + ", ".join(f"{a:.1f}s" for a, _ in ccfg["_react"])
+                        + (f", word '{ccfg['_punch_word']}'" if ccfg.get("_punch_word") else ""))
         base = f"{rank:02d}_{slugify(clip['title'], 45)}"
         write_captions(clip, segments, ccfg, folder / f"{base}.ass", folder / f"{base}.srt")
         r_src, r_t0 = hq.get(rank - 1, (src, 0.0))
@@ -1994,6 +2114,9 @@ def _process(source: str, cfg: dict, local: bool, credit: str, local_title: str,
         h = probe_size(r_src)[1]
         where = "high-quality download" if r_src != src else ("original file" if local else "first download")
         clip["_rendered"] = f"{ccfg['_layout']} layout, from the {where} ({h}p, {clip['_fps']:.2f} fps)"
+        if ccfg.get("_react"):
+            clip["_rendered"] += (f"; {len(ccfg['_react'])} face zoom(s)"
+                                  + (f", punch word {clip['_punch']}" if clip.get("_punch") else ""))
         clip["_qa"] = problems + notes
         if problems or notes:
             log(f"  clip {rank}: quality check: {'; '.join(problems + notes)}")

@@ -8,7 +8,8 @@ av>=11,<16
 numpy>=1.26,<3
 google-genai>=1.20,<4
 gradio>=6.31,<7
-opencv-python-headless>=4.8,<6     # face tracking (speaker-following crop, facecam finder)
+opencv-python-headless>=4.8,<6     # face tracking (speaker-following crop, facecam finder), person cut-out
+pillow>=10,<13                     # punch word text
 # NVIDIA GPU libraries for Whisper - Windows/Linux only (Macs have no CUDA)
 nvidia-cublas-cu12; sys_platform != "darwin"
 nvidia-cudnn-cu12>=9,<10; sys_platform != "darwin"
