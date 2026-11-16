@@ -227,7 +227,17 @@ def word_overlay(src: Path, start: float, dur: float, fps_str: str, fps: float, 
     cy = min(max(top + 0.07, 0.13), 0.40) * H
     hexs = color.lstrip("#")
     rgb = tuple(int(hexs[i:i + 2], 16) for i in (0, 2, 4))
-    base = _text_rgba(word, W, H, cy, H * 0.115, rgb)
+    full = _text_rgba(word, W, H, cy, H * 0.115, rgb)
+    # only the rows the word (and its shadow) touch are worked on: at 4K a full float frame is ~130 MB.
+    # The pop-in scales about the word's centre and never grows past 1.0, so the band always holds it.
+    rows = np.where(full[..., 3].max(axis=1) > 0)[0]
+    y0 = int(rows[0]) if len(rows) else 0
+    y1 = int(rows[-1]) + 1 if len(rows) else 2
+    y0, y1 = max(0, y0 - 2), min(H, y1 + 2)
+    base = np.ascontiguousarray(full[y0:y1])
+    del full
+    bh = y1 - y0
+    frame = np.zeros((H, W, 4), np.uint8)     # transparent everywhere except the band
     enc = subprocess.Popen(["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{W}x{H}",
                             "-r", fps_str, "-i", "-", "-c:v", "png", "-pix_fmt", "rgba", str(out)],
                            stdin=subprocess.PIPE)
@@ -236,16 +246,15 @@ def word_overlay(src: Path, start: float, dur: float, fps_str: str, fps: float, 
             sc, al = _anim(i / fps, dur)
             layer = base
             if sc < 0.999:   # scale the finished layer about the word's centre
-                M = cv2.getRotationMatrix2D((W / 2, cy), 0, sc)
-                layer = cv2.warpAffine(base, M, (W, H), flags=cv2.INTER_LINEAR)
+                M = cv2.getRotationMatrix2D((W / 2, cy - y0), 0, sc)
+                layer = cv2.warpAffine(base, M, (W, bh), flags=cv2.INTER_LINEAR)
             a = layer[..., 3] * al
             if masks:
-                k = cv2.resize(masks[i], (W, H), interpolation=cv2.INTER_LINEAR)
+                k = cv2.resize(masks[i], (W, H), interpolation=cv2.INTER_LINEAR)[y0:y1]
                 a = a * (1 - k)
-            rgba = np.empty((H, W, 4), np.uint8)
-            rgba[..., :3] = (layer[..., :3] * 255).astype(np.uint8)
-            rgba[..., 3] = (np.clip(a, 0, 1) * 255).astype(np.uint8)
-            enc.stdin.write(rgba.tobytes())
+            frame[y0:y1, :, :3] = (layer[..., :3] * 255).astype(np.uint8)
+            frame[y0:y1, :, 3] = (np.clip(a, 0, 1) * 255).astype(np.uint8)
+            enc.stdin.write(frame.tobytes())
         enc.stdin.close()
         enc.wait(timeout=300)
     except Exception:

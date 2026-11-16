@@ -9,7 +9,7 @@ Pipeline
   4. (Optional) Gemini watches the best candidates, picks the final clips and writes titles
   5. Snap every cut to word boundaries, keeping the payoff inside the clip
   6. Re-download only the chosen moments at the best quality available (SDR, up to 4K / 60 fps)
-  7. Render 1080x1920 clips at the source frame rate: speaker-tracked crop, blurred-background or
+  7. Render 1080x1920 (or 1440p / 4K) clips at the source frame rate: speaker-tracked crop, blurred-background or
      facecam layout, word-highlight captions, hook banner, two-pass loudness normalisation
   8. Check every clip (length, frame rate, audio, black frames, loudness) before calling it done
   9. Save to  <output_root>/DD-MM-YYYY/NN_<channel>_<video>/
@@ -19,6 +19,7 @@ Usage
   python clipper.py URL1 URL2 ...            (several videos)
   python clipper.py --list links.txt         (one link per line)
   python clipper.py --file video.mp4 --credit "CreatorName"   (local file)
+  python clipper.py --live "https://www.twitch.tv/<channel>"  (clip a stream while it's live)
 """
 from __future__ import annotations
 
@@ -93,10 +94,13 @@ DEFAULTS = {
     "hq_max_height": 2160,               # YouTube: up to 4K for the final clips (downscaled to 1080x1920 = sharp)
     "twitch_hq_max_height": 1080,        # Twitch: "source" quality is usually 1080p60
     "max_fps": 60,                       # keep the source frame rate up to this (YouTube Shorts plays 60 fps)
+    "output_height": 1920,               # 1920 = 1080x1920, 2560 = 1440x2560, 3840 = 2160x3840 (4K)
+    "output_fps": "source",              # "source" (capped at max_fps) | 60 | 30
+    "file_size": "balanced",             # smaller | balanced | best: sets nvenc_cq / x264_crf / max_bitrate
     "encoder": "auto",                   # auto (NVIDIA GPU if it works, else CPU) | nvenc | x264
     "nvenc_cq": 22,                      # GPU encoder quality (lower = better, bigger files)
     "x264_crf": 20,                      # CPU encoder quality (lower = better, bigger files)
-    "max_bitrate": "20M",                # cap: YouTube re-encodes everything, more than ~20 Mbps is just upload time
+    "max_bitrate": "20M",                # cap at 1080p (x1.7 at 1440p, x3.5 at 4K): YouTube re-encodes everything
     "x264_preset": "slow",               # CPU encoder effort: slower = better quality per MB
     "audio_bitrate": "192k",
     "target_lufs": -14,                  # loudness target (YouTube/TikTok normalise around -14)
@@ -118,14 +122,97 @@ DEFAULTS = {
     "vision_review": True,               # Gemini WATCHES each candidate (low-res preview) before picking
     "vision_batch": 6,                   # candidate previews per Gemini video request
     "vision_preview_height": 360,        # preview resolution sent to Gemini (keeps tokens low)
+    "live_clips_per_window": 2,          # live mode: clips from each 10-minute window
+    "live_ai_pool_size": 12,             # live mode: candidates Gemini reviews per window (keeps a long stream
+                                         # inside the free daily quota)
 }
 CAMPAIGNS_PATH = HERE / "campaigns.json"
 
-# facecam layout (1080x1920): facecam on top, overlay band, gameplay below
+# Every layout is designed on a 1080x1920 canvas and scaled by k = output_height / 1920 at render time,
+# so 1440p and 4K are rendered at their real size (not upscaled at the end). Captions stay on a 1080x1920
+# ASS canvas: libass scales them, sharply, to the real frame.
+BASE_W, BASE_H = 1080, 1920
+RESOLUTIONS = {"1080p": 1920, "1440p": 2560, "4K": 3840}      # label -> output_height
+BITRATE_FACTOR = {1920: 1.0, 2560: 1.7, 3840: 3.5}           # max_bitrate is set for 1080p
+FILE_SIZES = {   # Settings "File size" -> encoder quality (lower cq/crf = better, bigger)
+    "smaller": {"nvenc_cq": 25, "x264_crf": 23, "max_bitrate": "12M"},
+    "balanced": {"nvenc_cq": 22, "x264_crf": 20, "max_bitrate": "20M"},
+    "best": {"nvenc_cq": 19, "x264_crf": 18, "max_bitrate": "35M"},
+}
+
+# facecam layout (on the 1080x1920 canvas): facecam on top, overlay band, gameplay below
 FC_CAM_H = 720
 FC_BAND_H = 160
 FC_GAME_Y = FC_CAM_H + FC_BAND_H
 FC_BAND_COLOR = "0x0E0B16"
+
+
+def ev(v: float) -> int:
+    """Nearest even integer (video sizes and offsets must be even for yuv420p)."""
+    return int(round(v / 2.0)) * 2
+
+
+def out_height(cfg: dict) -> int:
+    try:
+        h = int(cfg.get("output_height") or BASE_H)
+    except (TypeError, ValueError):
+        h = BASE_H
+    return h if h in BITRATE_FACTOR else BASE_H
+
+
+def out_size(cfg: dict) -> tuple[int, int]:
+    """(width, height) of the finished clip: 1080x1920, 1440x2560 or 2160x3840."""
+    h = out_height(cfg)
+    return ev(BASE_W * h / BASE_H), h
+
+
+def fc_geometry(cfg: dict) -> tuple[int, int, int]:
+    """(cam height, band height, gameplay top) of the facecam layout at the output size."""
+    k = out_height(cfg) / BASE_H
+    cam, band = ev(FC_CAM_H * k), ev(FC_BAND_H * k)
+    return cam, band, cam + band
+
+
+def _rate(text: str) -> tuple[float, str] | None:
+    m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*([kKmM]?)\s*$", str(text or ""))
+    return (float(m.group(1)), m.group(2).upper()) if m else None
+
+
+def scaled_bitrate(cfg: dict) -> str:
+    """max_bitrate (set for 1080p) scaled for the output resolution: x1.7 at 1440p, x3.5 at 4K."""
+    mx = str(cfg.get("max_bitrate") or "20M")
+    r = _rate(mx)
+    f = BITRATE_FACTOR[out_height(cfg)]
+    if not r or f == 1.0:
+        return mx
+    return f"{r[0] * f:g}{r[1]}"
+
+
+def mbps(rate: str) -> float:
+    r = _rate(rate)
+    if not r:
+        return 20.0
+    return r[0] / 1000 if r[1] == "K" else r[0] if r[1] == "M" else r[0] / 1e6
+
+
+def estimate_clip_mb(cfg: dict, seconds: float = 30.0) -> tuple[float, float]:
+    """(typical, worst case) MB for a clip of this length at the chosen resolution/fps/file size.
+    Quality-targeted encoding uses only what the picture needs: busy gameplay runs near the bitrate cap,
+    talking heads far below it. Typical = ~55% of the cap at 60 fps, ~40% at 30 fps; worst = the cap."""
+    cap = mbps(scaled_bitrate(cfg))
+    fps = str(cfg.get("output_fps") or "source")
+    fill = 0.40 if fps == "30" else 0.55
+    audio = mbps(str(cfg.get("audio_bitrate") or "192k"))
+    to_mb = lambda v: (v + audio) * seconds / 8
+    return round(to_mb(cap * fill)), round(to_mb(cap))
+
+
+def render_fps(cfg: dict, src_fps: float) -> tuple[str, float]:
+    """Output frame rate: "source" = the source's own rate capped at max_fps; 60 or 30 = exactly that."""
+    want = str(cfg.get("output_fps") or "source").strip().lower()
+    if want in ("60", "30"):
+        return want, float(want)
+    return output_fps(src_fps, float(cfg.get("max_fps") or 60))
 
 PROMO_WORDS = [
     "sponsor", "sponsored", "use code", "promo code", "link in the description",
@@ -1381,8 +1468,17 @@ def chapter_at(meta: dict, t: float) -> str:
     return ""
 
 
+def src_time(meta: dict, t: float) -> float:
+    """File time -> time in the original video (the --section offset added; live mode: the stream time)."""
+    if callable(meta.get("_abs")):
+        return float(meta["_abs"](t))
+    return t + meta.get("offset", 0)
+
+
 def source_link(meta: dict, t: float) -> str:
     """Link to the original video at time t (file time; the --section offset is added)."""
+    if callable(meta.get("_link")):   # live mode: VOD link when known, else the stream time
+        return meta["_link"](t)
     t = int(t + meta.get("offset", 0))
     link = meta["url"]
     if meta.get("id") and "youtu" in link:
@@ -1520,7 +1616,7 @@ def encoder_args(kind: str, cfg: dict, fps: float) -> list[str]:
     high-bitrate master: quality-targeted rate control, adaptive quantisation, a keyframe every 2 s."""
     gop = str(max(1, int(round(fps * 2))))
     cq = str(cfg.get("nvenc_cq", 22))
-    mx = str(cfg.get("max_bitrate") or "20M")
+    mx = scaled_bitrate(cfg)
     m = re.match(r"^(\d+(?:\.\d+)?)([kKmM]?)$", mx)
     buf = f"{float(m.group(1)) * 2:g}{m.group(2)}" if m else mx
     if kind == "nvenc":
@@ -1536,27 +1632,36 @@ def encoder_args(kind: str, cfg: dict, fps: float) -> list[str]:
 
 def pick_encoder(cfg: dict | None = None) -> str:
     """'nvenc' (GPU, high-quality settings), 'nvenc_basic' (GPU, plain settings) or 'x264' (CPU).
-    Tested once with a real 1080x1920 encode, so a GPU that can't do it never fails a clip."""
+    Tested once per output size with a real encode at that size (e.g. 2160x3840), so a GPU that can't do it
+    never fails a clip."""
     cfg = cfg or DEFAULTS
     want = str(cfg.get("encoder", "auto")).lower()
+    W, H = out_size(cfg)
+    slot = _enc_slot(cfg)
     with _ENC_LOCK:
-        if want not in _ENCODER:
+        if slot not in _ENCODER:
             choice = "x264"
             if want in ("auto", "nvenc"):
                 for kind in ("nvenc", "nvenc_basic"):
                     try:
-                        run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=1080x1920:r=60:d=0.5",
+                        run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"color=c=black:s={W}x{H}:r=60:d=0.5",
                              *encoder_args(kind, cfg, 60), "-f", "null", "-"])
                         choice = kind
                         break
                     except Exception:
                         continue
-            _ENCODER[want] = choice
+            _ENCODER[slot] = choice
+            if choice == "x264" and want in ("auto", "nvenc") and H != BASE_H:
+                log(f"The GPU encoder can't do {W}x{H} here")
             log({"nvenc": "Using NVIDIA GPU encoder (h264_nvenc, high-quality settings)",
                  "nvenc_basic": "Using NVIDIA GPU encoder (h264_nvenc, basic settings)",
                  "x264": f"Using CPU encoder (libx264, preset {cfg.get('x264_preset', 'slow')}, "
                          f"CRF {cfg.get('x264_crf', 20)})"}[choice])
-        return _ENCODER[want]
+        return _ENCODER[slot]
+
+
+def _enc_slot(cfg: dict) -> tuple[str, int]:
+    return str(cfg.get("encoder", "auto")).lower(), out_height(cfg)
 
 
 TRUE_PEAK = -1.5   # dBTP ceiling (streaming platforms' recommendation)
@@ -1606,35 +1711,41 @@ def measure_loudness(src: Path, start: float, dur: float, af: str = "") -> tuple
 
 
 def overlay_geometry(cfg: dict, layout: str) -> tuple[int, int, int] | None:
-    """(width, height, y) of the overlay image in the 1080x1920 frame, clear of cam, gameplay and captions."""
+    """(width, height, y) of the overlay image in the output frame, clear of cam, gameplay and captions."""
     if not cfg.get("overlay_image"):
         return None
+    W, H = out_size(cfg)
+    k = H / BASE_H
     iw, ih = probe_size(Path(cfg["overlay_image"]))
-    w = int(round(1080 * float(cfg["overlay_width_pct"]) / 100 / 2) * 2)
-    h = int(round(w * ih / iw / 2) * 2)
+    w = ev(W * float(cfg["overlay_width_pct"]) / 100)
+    h = ev(w * ih / iw)
     if layout == "facecam":   # in the band between facecam and gameplay
-        h = min(h, FC_BAND_H - 6)
-        w = int(round(h * iw / ih / 2) * 2) if h < round(w * ih / iw) else w
-        y = FC_CAM_H + (FC_BAND_H - h) // 2
+        cam_h, band_h, _ = fc_geometry(cfg)
+        h = min(h, band_h - ev(6 * k))
+        w = ev(h * iw / ih) if h < round(w * ih / iw) else w
+        y = cam_h + (band_h - h) // 2
     elif layout == "crop":    # bottom edge, below the captions
-        y = 1920 - h - 80
+        y = H - h - ev(80 * k)
     else:                     # blur: below the gameplay and captions (the banner sits above the gameplay)
-        y = 1540
+        y = ev(1540 * k)
     return w, h, y
 
 
 def video_chain(layout: str, cfg: dict, sw: int, sh: int, fps_str: str, punch_input: int | None = None) -> str:
-    """filter_complex for the picture, ending in [v0] (1080x1920, bt709, yuv420p, source frame rate).
+    """filter_complex for the picture, ending in [v0] (output size from out_size(): 1080x1920, 1440x2560 or
+    2160x3840; bt709, yuv420p, at fps_str). Every position is the 1080x1920 design scaled by k = H / 1920.
     facecam: cfg["_react"] [(a, b), ...] cuts to the face full-screen for those clip seconds; punch_input is
     the ffmpeg input index of the transparent "word behind the head" video for the first of them."""
     even = lambda v: int(v) // 2 * 2
+    W, H = out_size(cfg)
     head = (f"[0:v]fps={fps_str},scale=in_color_matrix=auto:out_color_matrix=bt709:out_range=tv,"
             f"format=yuv420p")
     if layout == "facecam":
+        cam_h, _, game_y = fc_geometry(cfg)
         n = cfg["_cam_crop_n"]                    # trimmed cam crop, 0-1 of the frame
         cx, cy, cw, ch = even(n[0] * sw), even(n[1] * sh), even(n[2] * sw), even(n[3] * sh)
-        game_h = 1920 - FC_GAME_Y
-        gw = min(sw, even(sh * 1080 / game_h))
+        game_h = H - game_y
+        gw = min(sw, even(sh * W / game_h))
         gx = (sw - gw) // 2
         b = cfg["_cam_box_n"]                     # the whole cam (with its frame), to keep it out of the gameplay
         bx, bw = b[0] * sw, b[2] * sw
@@ -1648,16 +1759,16 @@ def video_chain(layout: str, cfg: dict, sw: int, sh: int, fps_str: str, punch_in
         rc = react_crop_px(cfg, sw, sh) if react else None
         split = (f"{head},split=3[cam][game][rx];" if rc else f"{head},split=2[cam][game];")
         chain = (f"{split}"
-                 f"[cam]crop={cw}:{ch}:{cx}:{cy},scale=1080:{FC_CAM_H}:{SCALE},unsharp=5:5:0.5,"
-                 f"pad=1080:1920:0:0:color={FC_BAND_COLOR}[base];"
-                 f"[game]crop={gw}:{sh}:{gx}:0,scale=1080:{game_h}:force_original_aspect_ratio=increase:{SCALE},"
-                 f"crop=1080:{game_h}[g];"
-                 f"[base][g]overlay=0:{FC_GAME_Y}" + ("[vs]" if rc else "[v0]"))
+                 f"[cam]crop={cw}:{ch}:{cx}:{cy},scale={W}:{cam_h}:{SCALE},unsharp=5:5:0.5,"
+                 f"pad={W}:{H}:0:0:color={FC_BAND_COLOR}[base];"
+                 f"[game]crop={gw}:{sh}:{gx}:0,scale={W}:{game_h}:force_original_aspect_ratio=increase:{SCALE},"
+                 f"crop={W}:{game_h}[g];"
+                 f"[base][g]overlay=0:{game_y}" + ("[vs]" if rc else "[v0]"))
         if not rc:
             return chain
         on = "+".join(f"between(t\\,{a:.3f}\\,{b:.3f})" for a, b in react)
         x, y, w, h = rc
-        chain += (f";[rx]crop={w}:{h}:{x}:{y},scale=1080:1920:{SCALE},unsharp=5:5:0.7[rz];"
+        chain += (f";[rx]crop={w}:{h}:{x}:{y},scale={W}:{H}:{SCALE},unsharp=5:5:0.7[rz];"
                   f"[vs][rz]overlay=0:0:enable={on}")
         if punch_input is None:
             return chain + "[v0]"
@@ -1665,21 +1776,22 @@ def video_chain(layout: str, cfg: dict, sw: int, sh: int, fps_str: str, punch_in
         return (chain + f"[vr];[{punch_input}:v]format=rgba,setpts=PTS-STARTPTS+{a:.3f}/TB[pw];"
                 f"[vr][pw]overlay=0:0:eof_action=pass:enable=between(t\\,{a:.3f}\\,{b:.3f})[v0]")
     if layout == "crop":
-        cw = even(sh * 1080 / 1920)
+        cw = even(sh * BASE_W / BASE_H)
         if cw >= sw:   # source already 9:16 or narrower: fill the frame
-            return f"{head},scale=1080:1920:force_original_aspect_ratio=increase:{SCALE},crop=1080:1920[v0]"
+            return f"{head},scale={W}:{H}:force_original_aspect_ratio=increase:{SCALE},crop={W}:{H}[v0]"
         pts = cfg.get("_track")
         x = framing.crop_x_expr(pts, sw, cw) if pts else str(even((sw - cw) / 2))
         # crop first, then a single resize: sharper and faster than enlarging the whole frame first
-        return f"{head},crop={cw}:{sh}:{x}:0,scale=1080:1920:{SCALE}[v0]"
-    # blur: the full frame over a blurred, darkened copy of itself (blurred at 1/4 size: same look, 16x less work)
+        return f"{head},crop={cw}:{sh}:{x}:0,scale={W}:{H}:{SCALE}[v0]"
+    # blur: the full frame over a blurred, darkened copy of itself (blurred at a small fixed size whatever the
+    # output size: same look, far less work), then the sharp frame on top
     z = float(cfg.get("zoom", 1.0))
-    fw = int(round(1080 * z / 2) * 2)
-    fg = (f"scale={fw}:-2:{SCALE},crop=min(iw\\,1080):min(ih\\,1920)" if sw >= sh else
-          f"scale=1080:1920:force_original_aspect_ratio=decrease:{SCALE}")   # vertical/square source: fit it
+    fw = ev(W * z)
+    fg = (f"scale={fw}:-2:{SCALE},crop=min(iw\\,{W}):min(ih\\,{H})" if sw >= sh else
+          f"scale={W}:{H}:force_original_aspect_ratio=decrease:{SCALE}")   # vertical/square source: fit it
     return (f"{head},split=2[a][b];"
             f"[a]scale=270:480:force_original_aspect_ratio=increase:flags=bilinear,crop=270:480,boxblur=6:2,"
-            f"scale=1080:1920:flags=bicubic,eq=brightness=-0.10[bg];"
+            f"scale={W}:{H}:flags=bicubic,eq=brightness=-0.10[bg];"
             f"[b]{fg}[fg];"
             f"[bg][fg]overlay=(W-w)/2:(H-h)/2[v0]")
 
@@ -1691,7 +1803,8 @@ def render_clip(src: Path, clip: dict, folder: Path, base: str, cfg: dict, audio
     out_name = f"{base}.mp4"
     layout = cfg.get("_layout") or cfg["layout"]
     sw, sh = probe_size(src)
-    fps_str, fps = output_fps(probe_fps(src), float(cfg.get("max_fps") or 60))
+    W, H = out_size(cfg)
+    fps_str, fps = render_fps(cfg, probe_fps(src))
     start = max(0.0, clip["start"] - t0)
     dur = clip["end"] - clip["start"]
     ov = overlay_geometry(cfg, layout)
@@ -1702,7 +1815,8 @@ def render_clip(src: Path, clip: dict, folder: Path, base: str, cfg: dict, audio
         a, b = react[0]
         if rc:
             punch = reactfx.word_overlay(src, start + a, b - a, fps_str, fps, rc, cfg["_punch_word"],
-                                         folder / f".{base}_punch.mov", str(cfg.get("punch_color") or "#FFFFFF"))
+                                         folder / f".{base}_punch.mov", str(cfg.get("punch_color") or "#FFFFFF"),
+                                         W=W, H=H)
             if punch:
                 clip["_punch"] = f"'{cfg['_punch_word']}' " + ("behind the head" if punch["behind"] else
                                                                 "in front (no person-cutout model)")
@@ -1738,7 +1852,7 @@ def render_clip(src: Path, clip: dict, folder: Path, base: str, cfg: dict, audio
             raise
         log("GPU encode failed, retrying on CPU")
         with _ENC_LOCK:
-            _ENCODER[str(cfg.get("encoder", "auto")).lower()] = "x264"
+            _ENCODER[_enc_slot(cfg)] = "x264"
         cmd = head + ["-t", f"{dur:.3f}", "-filter_complex", chain, "-map", "[vout]",
                       *encoder_args("x264", cfg, fps)] + tail
         run(cmd, cwd=folder)
@@ -1746,12 +1860,14 @@ def render_clip(src: Path, clip: dict, folder: Path, base: str, cfg: dict, audio
         if punch:
             Path(punch["path"]).unlink(missing_ok=True)
     clip["_fps"] = fps
+    clip["_size"] = (W, H)
     return folder / out_name
 
 
-def qa_check(path: Path, dur: float, fps: float, audio: bool, target_lufs: float = -14) -> tuple[list, list]:
+def qa_check(path: Path, dur: float, fps: float, audio: bool, target_lufs: float = -14,
+             size: tuple[int, int] = (BASE_W, BASE_H)) -> tuple[list, list]:
     """Check a finished clip. Returns (problems, notes): problems mean the file is broken and worth one
-    re-render; notes are worth a look but the clip is usable."""
+    re-render; notes are worth a look but the clip is usable. size: the expected (width, height)."""
     try:
         res = run(["ffprobe", "-v", "error", "-show_entries",
                    "stream=codec_type,width,height,avg_frame_rate:format=duration", "-of", "json", str(path)])
@@ -1764,7 +1880,7 @@ def qa_check(path: Path, dur: float, fps: float, audio: bool, target_lufs: float
     if not v:
         return ["no video stream"], []
     problems, notes = [], []
-    if (v.get("width"), v.get("height")) != (1080, 1920):
+    if (v.get("width"), v.get("height")) != tuple(size):
         problems.append(f"size {v.get('width')}x{v.get('height')}")
     got = float((info.get("format") or {}).get("duration") or 0)
     if abs(got - dur) > 0.5:
@@ -1807,7 +1923,7 @@ def write_campaign_details(clip: dict, rank: int, meta: dict, cfg: dict, path: P
     game = clip.get("game") or chapter_at(meta, clip["start"])
     if game_tag(game) and game_tag(game) not in tags:
         tags.append(game_tag(game))
-    t0, t1 = clip["start"] + meta.get("offset", 0), clip["end"] + meta.get("offset", 0)
+    t0, t1 = src_time(meta, clip["start"]), src_time(meta, clip["end"])
     body = f"""TITLE
 {clip['title']}
 
@@ -1817,7 +1933,7 @@ CAPTION
 
 SOURCE
 {source_link(meta, clip['start'])}
-VOD time: {fmt_ts(t0)} - {fmt_ts(t1)}  ({clip['end'] - clip['start']:.0f}s)
+{meta.get('_time_label', 'VOD time')}: {fmt_ts(t0)} - {fmt_ts(t1)}  ({clip['end'] - clip['start']:.0f}s)
 
 {cfg.get('post_note', '')}
 
@@ -1859,7 +1975,7 @@ HASHTAGS
 
 --- info (not for upload) ---
 Rank: {rank} (1 = strongest)
-Source time: {fmt_ts(clip['start'] + meta.get('offset', 0))} - {fmt_ts(clip['end'] + meta.get('offset', 0))}  ({clip['end'] - clip['start']:.0f}s)
+{meta.get('_time_label', 'Source time')}: {fmt_ts(src_time(meta, clip['start']))} - {fmt_ts(src_time(meta, clip['end']))}  ({clip['end'] - clip['start']:.0f}s)
 Most-replayed score: {clip['heat']:.2f}   Loudness score: {clip['loud']:.2f}
 Why: {clip['reason']}
 {render_info(clip)}"""
@@ -2011,6 +2127,7 @@ def _process(source: str, cfg: dict, local: bool, credit: str, local_title: str,
         meta = {"title": local_title or src.stem, "channel": credit or "creator", "channel_url": "",
                 "url": "", "id": "", "duration": probe_duration(src), "heatmap": [], "view_count": None,
                 "offset": 0.0, "chapters": [], "twitch": False}
+        meta.update(cfg.get("_meta") or {})   # live mode: stream url, channel link, stream-time mapping
         log(f"Using local file: {src.name}")
     else:
         log(f"Downloading: {source}")
@@ -2048,10 +2165,17 @@ def _process(source: str, cfg: dict, local: bool, credit: str, local_title: str,
     cands = find_candidates(duration, segments, heat, loud, hype, speech, cfg, spike)
     k = int(cfg["num_clips"])
     lo, hi = float(cfg["min_clip_seconds"]), float(cfg["max_clip_seconds"])
+    # live mode: moments already clipped from an earlier (overlapping) window are off limits
+    avoid = [{"start": float(a), "end": float(b)} for a, b in (cfg.get("_avoid") or [])]
+    if avoid:
+        cands = [c for c in cands if not overlaps(c, avoid)]
+        log(f"Skipping {len(avoid)} moment(s) already clipped from the previous window")
     pool = pick_non_overlapping(cands, max(int(cfg.get("ai_pool_size") or 24), 2 * k))
     if gemini_watch(pool, src, segments, meta, cfg, work):
         pool = rerank_by_watch(pool)
     clips = gemini_pick(pool, segments, meta, cfg) if pool else None
+    if clips and avoid:   # Gemini may move a cut by a few seconds: re-check against what was already clipped
+        clips = [c for c in clips if not overlaps(c, avoid)] or None
     if clips:
         log(f"Gemini chose {len(clips)} clips")
     else:
@@ -2063,7 +2187,7 @@ def _process(source: str, cfg: dict, local: bool, credit: str, local_title: str,
             break
         c = dict(c)
         c["start"], c["end"] = refine_cut(c["start"], c["end"], segments, lo, hi, duration, c.get("payoff_abs"))
-        if not overlaps(c, clips):
+        if not overlaps(c, clips) and not overlaps(c, avoid):
             clips.append(c)
     roman = cfg.get("_lang") == "hi" and cfg.get("hinglish_roman_captions")
     if roman and not cfg.get("gemini_api_key"):
@@ -2075,6 +2199,9 @@ def _process(source: str, cfg: dict, local: bool, credit: str, local_title: str,
         if not c.get("banner"):
             c["banner"] = ""
     if not clips:
+        if cfg.get("_allow_empty"):   # live window with nothing new: normal, not an error
+            log("No new moments in this part")
+            return None
         raise RuntimeError("Video too short to make clips with the current length settings.")
 
     # high-quality footage for just these clips, aligned to the analysis timeline by their audio
@@ -2091,10 +2218,17 @@ def _process(source: str, cfg: dict, local: bool, credit: str, local_title: str,
         if hq:
             log(f"High-quality footage ready for {len(hq)} of {len(clips)} clips")
 
-    folder = make_video_folder(cfg, meta)
-    log(f"Rendering {len(clips)} clips -> {folder}")
+    if cfg.get("_folder"):   # live mode: one folder for the whole stream, clips numbered on from earlier windows
+        folder = Path(cfg["_folder"])
+        folder.mkdir(parents=True, exist_ok=True)
+    else:
+        folder = make_video_folder(cfg, meta)
+    first_no = int(cfg.get("_first_number") or 1)
+    W, H = out_size(cfg)
+    log(f"Rendering {len(clips)} clips -> {folder}  ({W}x{H}, "
+        + (f"{cfg.get('output_fps')} fps" if str(cfg.get("output_fps") or "source") != "source" else "source fps")
+        + f", max {scaled_bitrate(cfg)}bps)")
     summary = [f"{meta['title']}  —  {meta['channel']}", meta["url"], ""]
-    off = meta.get("offset", 0)
     pick_encoder(cfg)
 
     def render_one(rank: int, clip: dict) -> str:
@@ -2117,7 +2251,8 @@ def _process(source: str, cfg: dict, local: bool, credit: str, local_title: str,
                     log(f"  clip {rank}: {len(ccfg['_react'])} face zoom(s) at "
                         + ", ".join(f"{a:.1f}s" for a, _ in ccfg["_react"])
                         + (f", word '{ccfg['_punch_word']}'" if ccfg.get("_punch_word") else ""))
-        base = f"{rank:02d}_{slugify(clip['title'], 45)}"
+        clip["_number"] = number = first_no + rank - 1
+        base = f"{number:02d}_{slugify(clip['title'], 45)}"
         write_captions(clip, segments, ccfg, folder / f"{base}.ass", folder / f"{base}.srt")
         r_src, r_t0 = hq.get(rank - 1, (src, 0.0))
         r_audio = has_audio(r_src)
@@ -2131,16 +2266,20 @@ def _process(source: str, cfg: dict, local: bool, credit: str, local_title: str,
             r_src, r_t0, r_audio = src, 0.0, audio
             out = render_clip(r_src, clip, folder, base, ccfg, r_audio, r_t0)
         dur = clip["end"] - clip["start"]
-        problems, notes = (qa_check(out, dur, clip["_fps"], r_audio, float(cfg.get("target_lufs", -14)))
+        size = out_size(cfg)
+        problems, notes = (qa_check(out, dur, clip["_fps"], r_audio, float(cfg.get("target_lufs", -14)), size)
                            if cfg.get("qa_check", True) else ([], []))
         if problems:   # broken file: one more try on the CPU encoder from the analysis copy
             log(f"  clip {rank}: quality check failed ({'; '.join(problems)}) - re-rendering")
             r_src, r_t0, r_audio = src, 0.0, audio
             out = render_clip(r_src, clip, folder, base, {**ccfg, "_force_encoder": "x264"}, r_audio, r_t0)
-            problems, notes = qa_check(out, dur, clip["_fps"], r_audio, float(cfg.get("target_lufs", -14)))
+            problems, notes = qa_check(out, dur, clip["_fps"], r_audio, float(cfg.get("target_lufs", -14)), size)
         h = probe_size(r_src)[1]
         where = "high-quality download" if r_src != src else ("original file" if local else "first download")
-        clip["_rendered"] = f"{ccfg['_layout']} layout, from the {where} ({h}p, {clip['_fps']:.2f} fps)"
+        fps_mode = str(cfg.get("output_fps") or "source")
+        clip["_rendered"] = (f"{size[0]}x{size[1]} at {clip['_fps']:.2f} fps"
+                             f" ({'source frame rate' if fps_mode == 'source' else fps_mode + ' fps chosen'}); "
+                             f"{ccfg['_layout']} layout, from the {where} ({h}p)")
         if ccfg.get("_react"):
             clip["_rendered"] += (f"; {len(ccfg['_react'])} face zoom(s)"
                                   + (f", punch word {clip['_punch']}" if clip.get("_punch") else ""))
@@ -2154,15 +2293,21 @@ def _process(source: str, cfg: dict, local: bool, credit: str, local_title: str,
         (folder / f"{base}.ass").unlink(missing_ok=True)
         log(f"  {rank}/{len(clips)} done: {clip['title']}")
         flag = "  [CHECK: " + "; ".join(problems) + "]" if problems else ""
-        return f"{rank:02d}. [{fmt_ts(clip['start'] + off)}-{fmt_ts(clip['end'] + off)}] {clip['title']}{flag}"
+        return (f"{number:02d}. [{fmt_ts(src_time(meta, clip['start']))}-{fmt_ts(src_time(meta, clip['end']))}] "
+                f"{clip['title']}{flag}")
 
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max(1, int(cfg.get("render_workers") or 1))) as ex:
         summary += list(ex.map(lambda a: render_one(*a), enumerate(clips, 1)))
-    (folder / "_summary.txt").write_text("\n".join(summary) + "\n", encoding="utf-8")
+    mode = "a" if cfg.get("_folder") else "w"   # live: every window adds to the stream's summary/transcript
+    with open(folder / "_summary.txt", mode, encoding="utf-8") as f:
+        f.write("\n".join(summary) + "\n\n")
     if segments:
-        (folder / "_transcript.txt").write_text(
-            "\n".join(f"[{fmt_ts(s['start'] + off)}] {s['text']}" for s in segments), encoding="utf-8")
+        with open(folder / "_transcript.txt", mode, encoding="utf-8") as f:
+            f.write("\n".join(f"[{fmt_ts(src_time(meta, s['start']))}] {s['text']}" for s in segments) + "\n")
+    if isinstance(cfg.get("_made"), list):   # live mode: which moments this window clipped (file time)
+        cfg["_made"].extend({"start": c["start"], "end": c["end"], "title": c["title"],
+                             "number": c.get("_number")} for c in clips)
 
     if cfg.get("keep_source") and not local:
         shutil.move(str(src), str(folder / f"_source{src.suffix}"))
@@ -2191,12 +2336,22 @@ def main() -> None:
     ap.add_argument("--section", help="only download/process this part, e.g. 0:30:00-2:00:00")
     ap.add_argument("--find-facecam", metavar="URL", help="save facecam_check.png (frame ~10 min in + pixel grid)")
     ap.add_argument("--facecam-at", metavar="TIME", help="with --find-facecam: frame time instead of 0:10:00")
+    ap.add_argument("--live", metavar="URL", help="clip a Twitch/YouTube stream while it's live (--clips = clips "
+                                                  "per 10-minute window, default 2; Ctrl+C stops)")
     args = ap.parse_args()
 
     check_tools()
     cfg = load_config(args)
     if args.find_facecam:
         find_facecam(args.find_facecam, cfg, parse_time(args.facecam_at) if args.facecam_at else 600.0)
+        return
+    if args.live:
+        import live
+        try:
+            live.run_terminal(args.live, cfg, args.clips or int(cfg.get("live_clips_per_window") or 2))
+        except Exception as e:
+            log(f"FAILED: {args.live}\n{e}")
+            sys.exit(1)
         return
     urls = list(args.urls)
     if args.list:
