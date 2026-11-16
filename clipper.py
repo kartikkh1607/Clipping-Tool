@@ -585,8 +585,35 @@ def align_segment(seg: Path, wav: Path, nominal: float, work: Path) -> float | N
             continue
         corr, lag = best_lag(ref, probe)
         if corr >= 0.6:
-            return lo + lag / sr - a0
+            # the extracted WAV starts at the segment's first AUDIO sample; a stream-copied cut can start its
+            # audio a little after its video (FFmpeg 9: one AAC frame, ~21 ms), and rendering seeks on the
+            # video timeline, so return where the segment's VIDEO starts
+            return lo + lag / sr - a0 - av_start_gap(seg)
     return None
+
+
+def stream_start_times(path: Path) -> dict[str, float]:
+    """{"video": start_time, "audio": start_time} of the first stream of each kind (missing ones left out)."""
+    try:
+        res = run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,start_time", "-of", "json", str(path)])
+        out: dict[str, float] = {}
+        for s in json.loads(res.stdout).get("streams") or []:
+            kind, st = s.get("codec_type"), s.get("start_time")
+            if kind in ("video", "audio") and kind not in out and st not in (None, "N/A"):
+                out[kind] = float(st)
+        return out
+    except Exception:
+        return {}
+
+
+def av_start_gap(path: Path) -> float:
+    """How much later the audio stream starts than the video stream (seconds; 0 if unknown)."""
+    st = stream_start_times(path)
+    if "audio" in st and "video" in st:
+        gap = st["audio"] - st["video"]
+        if abs(gap) < 2.0:   # anything bigger is a broken file, not a priming offset
+            return gap
+    return 0.0
 
 
 # ----------------------------------------------------------------------------- facecam

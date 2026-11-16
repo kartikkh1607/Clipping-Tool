@@ -1,0 +1,4 @@
+*.onnx binary
+*.ttf binary
+*.png binary
+*.ico binary
